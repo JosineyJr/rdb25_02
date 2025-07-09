@@ -1,5 +1,5 @@
 CREATE UNLOGGED TABLE IF NOT EXISTS payments (
-    amount BIGINT NOT NULL,
+    amount DECIMAL NOT NULL,
     processor TEXT NOT NULL,
     requested_at TIMESTAMPTZ NOT NULL
 );

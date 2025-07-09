@@ -90,9 +90,12 @@ func (kf *KalmanFilter) Estimate() State {
 
 func (kf *KalmanFilter) FeedMeasurement(getHealth func() State) {
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
 		for range ticker.C {
 			kf.Predict()
+
 			kf.Update(getHealth(), kf.R)
 		}
 	}()

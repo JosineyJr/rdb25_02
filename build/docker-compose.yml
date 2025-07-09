@@ -26,16 +26,20 @@ services:
       - backend
       - payment-processor 
     depends_on:
-      - db
+      - redis
     environment:
-      - POSTGRES_URL=postgres://rinha:rinha@db:5432/rinha
+      - REDIS_URL=redis://rinha-redis:6379/0
       - PORT=9997
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
     ports:
       - 9997:9997
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.4"
           memory: "80MB"
 
   api2:
@@ -46,43 +50,65 @@ services:
       - backend
       - payment-processor
     depends_on:
-      - db
+      - redis
     environment:
-      - POSTGRES_URL=postgres://rinha:rinha@db:5432/rinha
-      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://rinha-redis:6379/0
       - PORT=9998
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
     ports:
       - 9998:9998
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.4"
           memory: "80MB"
 
-  db:
-    image: postgres:16-alpine
-    container_name: rinha-db
-    restart: always
-    environment:
-      POSTGRES_DB: rinha
-      POSTGRES_USER: rinha
-      POSTGRES_PASSWORD: rinha
-    ports:
-      - "5432:5432"
-    volumes:
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - ./postgresql.conf:/etc/postgresql/postgresql.conf
-    command: -c config_file=/etc/postgresql/postgresql.conf
+  api3:
+    image: josiney/rdb25_02:latest
+    container_name: rinha-api-3
+    hostname: api3
     networks:
       - backend
+      - payment-processor
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://rinha-redis:6379/0
+      - PORT=9996
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
+    ports:
+      - 9996:9996
     deploy:
       resources:
         limits:
-          cpus: "0.30"
-          memory: "150MB"
+          cpus: "0.4"
+          memory: "80MB"
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: rinha-redis
+    networks:
+      - backend
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "20MB"
 
 networks:
   backend:
+    name: rinha-backend
     driver: bridge
   payment-processor:
     external: true 
+
+volumes:
+  data_sql:

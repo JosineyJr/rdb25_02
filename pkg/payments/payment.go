@@ -1,7 +1,6 @@
 package payments
 
 import (
-	"bytes"
 	"time"
 )
 
@@ -16,12 +15,14 @@ type PaymentsPayload struct {
 	RequestedAt   time.Time `json:"requestedAt"`
 }
 
-type ConsolidatePayment struct {
-	Tag          string
-	Amount       float64
-	ProcessorURL string
-	Payload      *bytes.Reader
-	RequestedAt  time.Time
+type SummaryData struct {
+	Count int64   `json:"totalRequests"`
+	Total float64 `json:"totalAmount"`
+}
+
+type PaymentsSummary struct {
+	Default  SummaryData `json:"default"`
+	Fallback SummaryData `json:"fallback"`
 }
 
 type ServiceHealthPayload struct {

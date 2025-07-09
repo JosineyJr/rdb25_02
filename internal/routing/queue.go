@@ -1,12 +1,13 @@
 package routing
 
 import (
-	"net/http"
 	"sync"
+
+	"github.com/JosineyJr/rdb25_02/pkg/payments"
 )
 
 type batchRequest struct {
-	Requests []*http.Request
+	Requests []*payments.PaymentsPayload
 	Priority int
 }
 
@@ -16,7 +17,7 @@ type PriorityQueue struct {
 }
 
 func NewPriorityQueue() *PriorityQueue {
-	return &PriorityQueue{queues: make(map[int][]*batchRequest)}
+	return &PriorityQueue{queues: make(map[int][]*batchRequest, 17000)}
 }
 
 func (pq *PriorityQueue) Push(req *batchRequest) {
