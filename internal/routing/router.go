@@ -73,14 +73,18 @@ func (ar *AdaptiveRouter) UpdateHealthMetrics(
 }
 
 func (ar *AdaptiveRouter) Start(ctx context.Context) {
-	for i := 0; i < ar.workers; i++ {
+	for range ar.workers {
 		go func() {
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case p := <-ar.PayloadChan:
-					targetFunc, processorName := ar.chooseProcessor()
+					targetFunc, processorName, choose := ar.chooseProcessor()
+					if !choose {
+						continue
+					}
+
 					success := targetFunc(p)
 
 					ar.updateCircuitState(processorName, success)
@@ -94,7 +98,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 	}
 }
 
-func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string) {
+func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string, sent bool) {
 	ar.cbMutex.RLock()
 	defer ar.cbMutex.RUnlock()
 
@@ -102,23 +106,27 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPaylo
 		if time.Since(ar.cbLastOpenTime) > openStateTimeout {
 			ar.cbState = StateHalfOpen
 		} else {
-			return ar.sendToFallback, payments.FallbackProcessor
+			return ar.sendToFallback, payments.FallbackProcessor, true
 		}
 	}
 
 	if ar.cbState == StateHalfOpen {
-		return ar.sendToDefault, payments.DefaultProcessor
+		return ar.sendToDefault, payments.DefaultProcessor, true
 	}
 
 	if ar.defaultLatency < absoluteLatencyThreshold {
-		return ar.sendToDefault, payments.DefaultProcessor
+		return ar.sendToDefault, payments.DefaultProcessor, true
+	}
+
+	if ar.fallbackLatency >= 3 || ar.defaultLatency >= 3 {
+		return nil, "", false
 	}
 
 	if ar.fallbackLatency > 0 && ar.defaultLatency > (5*ar.fallbackLatency) {
-		return ar.sendToFallback, payments.FallbackProcessor
+		return ar.sendToFallback, payments.FallbackProcessor, true
 	}
 
-	return ar.sendToDefault, payments.DefaultProcessor
+	return ar.sendToDefault, payments.DefaultProcessor, true
 }
 
 func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool) {
