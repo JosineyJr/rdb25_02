@@ -11,14 +11,10 @@ services:
     depends_on:
       - api1
       - api2
-    sysctls:
-      net.core.somaxconn: 65535
-      net.ipv4.tcp_tw_reuse: "1"
-      net.ipv4.tcp_fin_timeout: "15"
     deploy:
       resources:
         limits:
-          cpus: "0.15"
+          cpus: "0.2"
           memory: "60MB"
 
   api1:
@@ -42,7 +38,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.6"
           memory: "40MB"
 
   api2:
@@ -66,7 +62,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.6"
           memory: "40MB"
 
   redis:
@@ -82,7 +78,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.15"
+          cpus: "0.1"
           memory: "20MB"
 
 networks:

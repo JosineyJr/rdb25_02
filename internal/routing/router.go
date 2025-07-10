@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,10 +36,10 @@ type AdaptiveRouter struct {
 	done            chan struct{}
 	PayloadChan     chan *payments.PaymentsPayload
 	workers         int
-	cbState         CircuitState
+	cbState         atomic.Int32
 	cbFailures      atomic.Int32
-	defaultLatency  float64
-	fallbackLatency float64
+	defaultLatency  atomic.Uint64
+	fallbackLatency atomic.Uint64
 	cbMutex         sync.RWMutex
 }
 
@@ -46,28 +47,29 @@ func NewAdaptiveRouter(
 	workers int,
 	agg *storage.RedisAggregator,
 ) *AdaptiveRouter {
-	return &AdaptiveRouter{
-		client:          &fasthttp.Client{},
-		workers:         workers,
-		PayloadChan:     make(chan *payments.PaymentsPayload, 10240),
-		done:            make(chan struct{}),
-		agg:             agg,
-		cbState:         StateClosed,
-		defaultLatency:  0.0,
-		fallbackLatency: 0.0,
+	ar := &AdaptiveRouter{
+		client:      &fasthttp.Client{},
+		workers:     workers,
+		PayloadChan: make(chan *payments.PaymentsPayload, 10240),
+		done:        make(chan struct{}),
+		agg:         agg,
+		cbMutex:     sync.RWMutex{},
 	}
+	ar.cbState.Store(int32(StateClosed))
+	return ar
 }
 
 func (ar *AdaptiveRouter) UpdateHealthMetrics(
 	defaultLatency, fallbackLatency float64,
 	isDefaultFailing bool,
 ) {
-	ar.cbMutex.Lock()
-	defer ar.cbMutex.Unlock()
-	ar.defaultLatency = defaultLatency
-	ar.fallbackLatency = fallbackLatency
-	if isDefaultFailing && ar.cbState != StateOpen {
+	ar.defaultLatency.Store(math.Float64bits(defaultLatency))
+	ar.fallbackLatency.Store(math.Float64bits(fallbackLatency))
+
+	if isDefaultFailing && CircuitState(ar.cbState.Load()) != StateOpen {
+		ar.cbMutex.Lock()
 		ar.openCircuit()
+		ar.cbMutex.Unlock()
 	}
 }
 
@@ -95,22 +97,28 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 }
 
 func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string) {
-	ar.cbMutex.RLock()
-	defer ar.cbMutex.RUnlock()
+	state := CircuitState(ar.cbState.Load())
 
-	if ar.cbState == StateOpen {
-		if time.Since(ar.cbLastOpenTime) > openStateTimeout {
-			ar.cbState = StateHalfOpen
+	if state == StateOpen {
+		ar.cbMutex.RLock()
+		lastOpenTime := ar.cbLastOpenTime
+		ar.cbMutex.RUnlock()
+		if time.Since(lastOpenTime) > openStateTimeout {
+			ar.cbState.CompareAndSwap(int32(StateOpen), int32(StateHalfOpen))
 		} else {
 			return ar.sendToFallback, payments.FallbackProcessor
 		}
 	}
 
-	if ar.cbState == StateHalfOpen {
+	state = CircuitState(ar.cbState.Load())
+	if state == StateHalfOpen {
 		return ar.sendToDefault, payments.DefaultProcessor
 	}
 
-	if ar.fallbackLatency > 0 && ar.defaultLatency > (4*ar.fallbackLatency) {
+	defLatency := math.Float64frombits(ar.defaultLatency.Load())
+	fallLatency := math.Float64frombits(ar.fallbackLatency.Load())
+
+	if fallLatency > 0 && defLatency > (4*fallLatency) {
 		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
@@ -121,22 +129,26 @@ func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool)
 	if processorName == payments.FallbackProcessor {
 		return
 	}
-	ar.cbMutex.Lock()
-	defer ar.cbMutex.Unlock()
 
-	if ar.cbState == StateHalfOpen {
+	state := CircuitState(ar.cbState.Load())
+	if state == StateHalfOpen {
 		if !success {
+			ar.cbMutex.Lock()
 			ar.openCircuit()
+			ar.cbMutex.Unlock()
 		} else {
 			ar.resetCircuit()
 		}
+
 		return
 	}
 
 	if !success {
 		newFailures := ar.cbFailures.Add(1)
 		if newFailures >= failureThreshold {
+			ar.cbMutex.Lock()
 			ar.openCircuit()
+			ar.cbMutex.Unlock()
 		}
 	} else if success {
 		ar.resetCircuit()
@@ -144,12 +156,12 @@ func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool)
 }
 
 func (ar *AdaptiveRouter) resetCircuit() {
-	ar.cbState = StateClosed
+	ar.cbState.Store(int32(StateClosed))
 	ar.cbFailures.Store(0)
 }
 
 func (ar *AdaptiveRouter) openCircuit() {
-	ar.cbState = StateOpen
+	ar.cbState.Store(int32(StateOpen))
 	ar.cbLastOpenTime = time.Now()
 }
 

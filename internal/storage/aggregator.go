@@ -50,7 +50,6 @@ func (a *RedisAggregator) Update(
 	processor string,
 	payload *payments.PaymentsPayload,
 ) {
-	defer time.Sleep(50 * time.Millisecond)
 	pipe := a.client.Pipeline()
 
 	amountInCents := int64(math.Round(payload.Amount * 100))

@@ -42,7 +42,7 @@ func main() {
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		125,
+		75,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
