@@ -15,11 +15,10 @@ services:
       resources:
         limits:
           cpus: "0.2"
-          memory: "60MB"
+          memory: "50MB"
 
-  api1:
-    image: josiney/rdb25_02:latest 
-    container_name: rinha-api-1
+  api1: &api
+    image: josiney/rdb25_02-arm64:latest 
     hostname: api1
     networks:
       - backend
@@ -39,17 +38,11 @@ services:
       resources:
         limits:
           cpus: "0.6"
-          memory: "40MB"
+          memory: "60MB"
 
   api2:
-    image: josiney/rdb25_02:latest
-    container_name: rinha-api-2
+    <<: *api
     hostname: api2
-    networks:
-      - backend
-      - payment-processor
-    depends_on:
-      - redis
     environment:
       - REDIS_SOCKET=/var/run/redis/redis.sock
       - PORT=9998
@@ -57,13 +50,6 @@ services:
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    volumes:
-      - redis-socket:/var/run/redis
-    deploy:
-      resources:
-        limits:
-          cpus: "0.6"
-          memory: "40MB"
 
   redis:
     image: redis:7.2-alpine
@@ -79,7 +65,7 @@ services:
       resources:
         limits:
           cpus: "0.1"
-          memory: "20MB"
+          memory: "180MB"
 
 networks:
   backend:
@@ -89,5 +75,4 @@ networks:
     external: true 
 
 volumes:
-  data_sql:
   redis-socket:
