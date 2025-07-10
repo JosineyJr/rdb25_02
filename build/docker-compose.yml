@@ -15,7 +15,7 @@ services:
       resources:
         limits:
           cpus: "0.15"
-          memory: "20MB"
+          memory: "60MB"
 
   # Instância 1 da API
   api1:
@@ -39,8 +39,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "80MB"
+          cpus: "0.3"
+          memory: "40MB"
 
   api2:
     image: josiney/rdb25_02:latest
@@ -63,8 +63,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "80MB"
+          cpus: "0.3"
+          memory: "40MB"
 
   api3:
     image: josiney/rdb25_02:latest
@@ -87,8 +87,32 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "80MB"
+          cpus: "0.3"
+          memory: "40MB"
+
+  api4:
+    image: josiney/rdb25_02:latest
+    container_name: rinha-api-4
+    hostname: api4
+    networks:
+      - backend
+      - payment-processor
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://rinha-redis:6379/0
+      - PORT=9995
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
+    ports:
+      - 9995:9995
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "40MB"
 
   redis:
     image: redis:7.2-alpine

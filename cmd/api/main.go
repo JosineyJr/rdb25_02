@@ -3,14 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
 
-	"github.com/JosineyJr/rdb25_02/internal/batching"
 	"github.com/JosineyJr/rdb25_02/internal/config"
 	"github.com/JosineyJr/rdb25_02/internal/health"
 	"github.com/JosineyJr/rdb25_02/internal/routing"
@@ -18,6 +15,7 @@ import (
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
+	_ "go.uber.org/automaxprocs"
 )
 
 func init() {
@@ -39,37 +37,19 @@ func main() {
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		runtime.NumCPU()*2,
+		16,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
 
-	paymentBatcher := batching.NewBatcher(ar)
-	paymentBatcher.Start(ctx)
-
-	healthClient := &http.Client{Timeout: 1 * time.Second}
-
-	getHealthDefaultFunc := func() routing.State {
-		return health.GetHealthStatus(
-			healthClient,
-			config.HEALTH_PROCESSOR_URL_DEFAULT,
-		)
-	}
-	kfDefault.FeedMeasurement(getHealthDefaultFunc)
-
-	getHealthFallbackFunc := func() routing.State {
-		return health.GetHealthStatus(
-			healthClient,
-			config.HEALTH_PROCESSOR_URL_FALLBACK,
-		)
-	}
-	kfFallback.FeedMeasurement(getHealthFallbackFunc)
+	healthUpdater := health.NewHealthUpdater(ar)
+	healthUpdater.Start(ctx)
 
 	requestHandler := func(reqCtx *fasthttp.RequestCtx) {
 		switch string(reqCtx.Path()) {
 		case "/payments":
 			if reqCtx.IsPost() {
-				handleCreatePayment(reqCtx, &logger, paymentBatcher)
+				handleCreatePayment(reqCtx, &logger, ar)
 			} else {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
@@ -104,6 +84,7 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info().Msg("Shutdown signal received. Gracefully stopping server...")
+	ar.Stop()
 
 	if err := server.Shutdown(); err != nil {
 		logger.Error().Err(err).Msg("Server shutdown failed")
@@ -115,7 +96,7 @@ func main() {
 func handleCreatePayment(
 	ctx *fasthttp.RequestCtx,
 	logger *zerolog.Logger,
-	batcher *batching.Batcher,
+	router *routing.AdaptiveRouter,
 ) {
 	var payload payments.PaymentsPayload
 
@@ -131,7 +112,7 @@ func handleCreatePayment(
 	}
 	payload.RequestedAt = time.Now().UTC()
 
-	batcher.Add(&payload)
+	router.EnqueuePayment(&payload)
 
 	ctx.SetStatusCode(fasthttp.StatusAccepted)
 }

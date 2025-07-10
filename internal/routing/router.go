@@ -1,25 +1,44 @@
 package routing
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
-	"net/http"
+	"sync"
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
 	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
+	"github.com/valyala/fasthttp"
+)
+
+// --- Estados do Circuit Breaker ---
+type CircuitState int
+
+const (
+	StateClosed CircuitState = iota
+	StateOpen
+	StateHalfOpen
+)
+
+const (
+	failureThreshold = 15
+	openStateTimeout = 5 * time.Second
 )
 
 type AdaptiveRouter struct {
-	agg     *storage.RedisAggregator
-	client  *http.Client
-	workers int
-	queue   *PriorityQueue
-	done    chan struct{}
+	agg             *storage.RedisAggregator
+	client          *fasthttp.Client
+	workers         int
+	done            chan struct{}
+	payloadChan     chan *payments.PaymentsPayload
+	cbState         CircuitState
+	cbFailures      int
+	cbLastOpenTime  time.Time
+	cbMutex         sync.RWMutex
+	defaultLatency  float64
+	fallbackLatency float64
 }
 
 func NewAdaptiveRouter(
@@ -27,11 +46,32 @@ func NewAdaptiveRouter(
 	agg *storage.RedisAggregator,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
-		client:  &http.Client{Timeout: 2 * time.Second},
-		workers: workers,
-		queue:   NewPriorityQueue(),
-		done:    make(chan struct{}),
-		agg:     agg,
+		client:          &fasthttp.Client{},
+		workers:         workers,
+		payloadChan:     make(chan *payments.PaymentsPayload, 5192),
+		done:            make(chan struct{}),
+		agg:             agg,
+		cbState:         StateClosed,
+		cbFailures:      0,
+		defaultLatency:  0.0,
+		fallbackLatency: 0.0,
+	}
+}
+
+func (ar *AdaptiveRouter) EnqueuePayment(p *payments.PaymentsPayload) {
+	ar.payloadChan <- p
+}
+
+func (ar *AdaptiveRouter) UpdateHealthMetrics(
+	defaultLatency, fallbackLatency float64,
+	isDefaultFailing bool,
+) {
+	ar.cbMutex.Lock()
+	defer ar.cbMutex.Unlock()
+	ar.defaultLatency = defaultLatency
+	ar.fallbackLatency = fallbackLatency
+	if isDefaultFailing && ar.cbState != StateOpen {
+		ar.openCircuit()
 	}
 }
 
@@ -40,52 +80,92 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 		go func() {
 			for {
 				select {
-				case <-ar.done:
+				case <-ctx.Done():
 					return
-				default:
-					br := ar.queue.Pop()
-					if br == nil {
-						continue
+				case p := <-ar.payloadChan:
+					targetFunc, processorName := ar.chooseProcessor()
+					success := targetFunc(p)
+
+					ar.updateCircuitState(processorName, success)
+
+					if !success {
+						log.Printf("Request for %s failed. Re-queueing once.", p.CorrelationID)
+						ar.payloadChan <- p
 					}
-					go ar.handleBatch(br)
 				}
 			}
 		}()
 	}
 }
 
-func (ar *AdaptiveRouter) handleBatch(br *batchRequest) {
-	var target func(*payments.PaymentsPayload) bool
-	target = ar.sendToDefault
+func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string) {
+	ar.cbMutex.Lock()
+	defer ar.cbMutex.Unlock()
 
-	failedPayloads := make([]*payments.PaymentsPayload, 0)
-
-	for _, payload := range br.Requests {
-		if !target(payload) {
-			failedPayloads = append(failedPayloads, payload)
-		}
-	}
-
-	if len(failedPayloads) > 0 {
-		if br.Priority < 10 {
-			failedBatch := &batchRequest{
-				Requests: failedPayloads,
-				Priority: br.Priority + 1,
-			}
-			ar.queue.Push(failedBatch)
+	if ar.cbState == StateOpen {
+		if time.Since(ar.cbLastOpenTime) > openStateTimeout {
+			log.Println("Circuit timeout expired. Moving to Half-Open state.")
+			ar.cbState = StateHalfOpen
 		} else {
-			fmt.Println("batch discarded 2")
+			return ar.sendToFallback, payments.FallbackProcessor
 		}
+	}
+
+	if ar.cbState == StateHalfOpen {
+		log.Println("Circuit is Half-Open. Routing next request to 'default' as a test.")
+		return ar.sendToDefault, payments.DefaultProcessor
+	}
+
+	if ar.fallbackLatency > 0 && ar.defaultLatency > (5*ar.fallbackLatency) {
+		log.Printf(
+			"Efficiency alert: Default latency (%.2fms) > 3 * Fallback latency (%.2fms). Using Fallback.",
+			ar.defaultLatency*1000,
+			ar.fallbackLatency*1000,
+		)
+		return ar.sendToFallback, payments.FallbackProcessor
+	}
+
+	return ar.sendToDefault, payments.DefaultProcessor
+}
+
+func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool) {
+	ar.cbMutex.Lock()
+	defer ar.cbMutex.Unlock()
+
+	if processorName == payments.FallbackProcessor {
+		return
+	}
+
+	if ar.cbState == StateHalfOpen {
+		if !success {
+			log.Println("Test request to 'default' failed. Re-opening circuit.")
+			ar.openCircuit()
+		} else {
+			log.Println("Test request to 'default' succeeded. Closing circuit.")
+			ar.resetCircuit()
+		}
+		return
+	}
+
+	if !success {
+		ar.cbFailures++
+		if ar.cbFailures >= failureThreshold {
+			log.Printf("%d consecutive failures reached. Opening circuit.", ar.cbFailures)
+			ar.openCircuit()
+		}
+	} else if success {
+		ar.resetCircuit()
 	}
 }
 
-func (ar *AdaptiveRouter) Stop() {
-	close(ar.done)
+func (ar *AdaptiveRouter) resetCircuit() {
+	ar.cbState = StateClosed
+	ar.cbFailures = 0
 }
 
-func (ar *AdaptiveRouter) EnqueueBatch(reqs []*payments.PaymentsPayload, priority int) {
-	br := &batchRequest{Requests: reqs, Priority: priority}
-	ar.queue.Push(br)
+func (ar *AdaptiveRouter) openCircuit() {
+	ar.cbState = StateOpen
+	ar.cbLastOpenTime = time.Now()
 }
 
 func (ar *AdaptiveRouter) sendToDefault(payload *payments.PaymentsPayload) bool {
@@ -108,38 +188,36 @@ func (ar *AdaptiveRouter) sendRequest(
 	url, processorName string,
 	payload *payments.PaymentsPayload,
 ) bool {
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(url)
+	req.Header.SetMethod(fasthttp.MethodPost)
+	req.Header.SetContentType("application/json")
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("Error marshalling payload: %v", err)
 		return false
 	}
+	req.SetBody(body)
 
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	err = ar.client.Do(req, resp)
 	if err != nil {
-		log.Printf("Error creating request: %v", err)
 		return false
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	startTime := time.Now()
-	resp, err := ar.client.Do(req)
-	latency := time.Since(startTime).Seconds()
-
-	var measuredState State
-	measuredState.Latency = latency
-
-	success := false
-	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		success = true
-		measuredState.ErrorRate = 0.0
+	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
 		ar.agg.Update(context.Background(), processorName, payload.Amount)
-	} else {
-		measuredState.ErrorRate = 1.0
+		return true
 	}
 
-	if resp != nil {
-		resp.Body.Close()
-	}
+	return false
+}
 
-	return success
+func (ar *AdaptiveRouter) Stop() {
+	close(ar.done)
 }

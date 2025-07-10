@@ -6,6 +6,7 @@ require (
 	github.com/redis/go-redis/v9 v9.11.0
 	github.com/rs/zerolog v1.34.0
 	github.com/valyala/fasthttp v1.63.0
+	go.uber.org/automaxprocs v1.6.0
 )
 
 require (
