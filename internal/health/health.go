@@ -3,7 +3,6 @@ package health
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -30,7 +29,6 @@ func NewHealthUpdater(router *routing.AdaptiveRouter) *HealthUpdater {
 }
 
 func (hu *HealthUpdater) Start(ctx context.Context) {
-	log.Println("Health Updater started.")
 	hu.updateMetrics()
 
 	go func() {
@@ -38,7 +36,6 @@ func (hu *HealthUpdater) Start(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				hu.ticker.Stop()
-				log.Println("Health Updater stopped.")
 				return
 			case <-hu.ticker.C:
 				hu.updateMetrics()
@@ -81,13 +78,11 @@ func (hu *HealthUpdater) getHealthStatus(healthURL string) payments.ServiceHealt
 
 	req, err := http.NewRequest(http.MethodGet, healthURL, nil)
 	if err != nil {
-		log.Printf("Failed to create health request for %s: %v", healthURL, err)
 		return defaultPayload
 	}
 
 	resp, err := hu.client.Do(req)
 	if err != nil {
-		log.Printf("Failed to get health from %s: %v", healthURL, err)
 		return defaultPayload
 	}
 	defer resp.Body.Close()
@@ -98,7 +93,6 @@ func (hu *HealthUpdater) getHealthStatus(healthURL string) payments.ServiceHealt
 
 	var healthPayload payments.ServiceHealthPayload
 	if err := json.NewDecoder(resp.Body).Decode(&healthPayload); err != nil {
-		log.Printf("Failed to decode health response from %s: %v", healthURL, err)
 		return defaultPayload
 	}
 

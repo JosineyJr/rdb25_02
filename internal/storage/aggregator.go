@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
@@ -13,12 +14,26 @@ type RedisAggregator struct {
 	key    string
 }
 
-func NewRedisAggregator(redisURL, key string) (*RedisAggregator, error) {
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		return nil, err
+func NewRedisAggregator(redisURL, redisSocket, key string) (*RedisAggregator, error) {
+	var client *redis.Client
+
+	if redisSocket != "" {
+		client = redis.NewClient(&redis.Options{
+			Network: "unix",
+			Addr:    redisSocket,
+		})
+	} else {
+		if redisURL == "" {
+			return nil, fmt.Errorf("REDIS_SOCKET or REDIS_URL must be set")
+		}
+
+		opts, err := redis.ParseURL(redisURL)
+		if err != nil {
+			return nil, err
+		}
+		client = redis.NewClient(opts)
 	}
-	client := redis.NewClient(opts)
+
 	return &RedisAggregator{client: client, key: key}, nil
 }
 

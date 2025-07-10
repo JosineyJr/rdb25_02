@@ -10,9 +10,9 @@ var (
 )
 
 type PaymentsPayload struct {
+	RequestedAt   time.Time `json:"requestedAt"`
 	CorrelationID string    `json:"correlationId"`
 	Amount        float64   `json:"amount"`
-	RequestedAt   time.Time `json:"requestedAt"`
 }
 
 type SummaryData struct {

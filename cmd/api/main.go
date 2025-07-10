@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -13,9 +13,9 @@ import (
 	"github.com/JosineyJr/rdb25_02/internal/routing"
 	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
-	_ "go.uber.org/automaxprocs"
 )
 
 func init() {
@@ -23,6 +23,7 @@ func init() {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -30,14 +31,17 @@ func main() {
 		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
 	).Level(zerolog.TraceLevel).With().Timestamp().Caller().Logger()
 
-	redisURL := os.Getenv("REDIS_URL")
-	summaryAggregator, err := storage.NewRedisAggregator(redisURL, "payments-summary")
+	summaryAggregator, err := storage.NewRedisAggregator(
+		os.Getenv("REDIS_URL"),
+		os.Getenv("REDIS_SOCKET"),
+		"payments-summary",
+	)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Unable to connect to Redis")
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		16,
+		6,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
@@ -71,8 +75,13 @@ func main() {
 	}
 
 	server := &fasthttp.Server{
-		Handler: requestHandler,
-		Name:    "PaymentService",
+		Handler:           requestHandler,
+		Name:              "PaymentService",
+		Concurrency:       512,
+		ReduceMemoryUsage: true,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       10 * time.Second,
 	}
 
 	go func() {
@@ -93,6 +102,8 @@ func main() {
 	logger.Info().Msg("Server stopped gracefully")
 }
 
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
 func handleCreatePayment(
 	ctx *fasthttp.RequestCtx,
 	logger *zerolog.Logger,
@@ -112,7 +123,15 @@ func handleCreatePayment(
 	}
 	payload.RequestedAt = time.Now().UTC()
 
-	router.EnqueuePayment(&payload)
+	ticker := time.NewTicker(45 * time.Millisecond)
+
+	select {
+	case router.PayloadChan <- &payload:
+		ctx.SetStatusCode(fasthttp.StatusAccepted)
+	case <-ticker.C:
+		logger.Warn().Msg("worker pool saturated. Rejecting request with 503.")
+		ctx.Error("Service Unavailable", fasthttp.StatusServiceUnavailable)
+	}
 
 	ctx.SetStatusCode(fasthttp.StatusAccepted)
 }

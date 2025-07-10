@@ -11,13 +11,16 @@ services:
     depends_on:
       - api1
       - api2
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_tw_reuse: "1"
+      net.ipv4.tcp_fin_timeout: "15"
     deploy:
       resources:
         limits:
           cpus: "0.15"
           memory: "60MB"
 
-  # Instância 1 da API
   api1:
     image: josiney/rdb25_02:latest 
     container_name: rinha-api-1
@@ -28,14 +31,14 @@ services:
     depends_on:
       - redis
     environment:
-      - REDIS_URL=redis://rinha-redis:6379/0
+      - REDIS_SOCKET=/var/run/redis/redis.sock
       - PORT=9997
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    ports:
-      - 9997:9997
+    volumes:
+      - redis-socket:/var/run/redis
     deploy:
       resources:
         limits:
@@ -52,62 +55,14 @@ services:
     depends_on:
       - redis
     environment:
-      - REDIS_URL=redis://rinha-redis:6379/0
+      - REDIS_SOCKET=/var/run/redis/redis.sock
       - PORT=9998
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    ports:
-      - 9998:9998
-    deploy:
-      resources:
-        limits:
-          cpus: "0.3"
-          memory: "40MB"
-
-  api3:
-    image: josiney/rdb25_02:latest
-    container_name: rinha-api-3
-    hostname: api3
-    networks:
-      - backend
-      - payment-processor
-    depends_on:
-      - redis
-    environment:
-      - REDIS_URL=redis://rinha-redis:6379/0
-      - PORT=9996
-      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
-      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
-      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
-      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    ports:
-      - 9996:9996
-    deploy:
-      resources:
-        limits:
-          cpus: "0.3"
-          memory: "40MB"
-
-  api4:
-    image: josiney/rdb25_02:latest
-    container_name: rinha-api-4
-    hostname: api4
-    networks:
-      - backend
-      - payment-processor
-    depends_on:
-      - redis
-    environment:
-      - REDIS_URL=redis://rinha-redis:6379/0
-      - PORT=9995
-      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
-      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
-      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
-      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    ports:
-      - 9995:9995
+    volumes:
+      - redis-socket:/var/run/redis
     deploy:
       resources:
         limits:
@@ -121,6 +76,9 @@ services:
       - backend
     ports:
       - "6379:6379"
+    volumes:
+      - redis-socket:/var/run/redis
+    command: sh -c "chown redis:redis /var/run/redis && redis-server --unixsocket /var/run/redis/redis.sock --unixsocketperm 777"
     deploy:
       resources:
         limits:
@@ -136,3 +94,4 @@ networks:
 
 volumes:
   data_sql:
+  redis-socket:
