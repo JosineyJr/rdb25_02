@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	defaultBatchSize    = 256
+	defaultBatchSize    = 512
 	defaultBatchTimeout = 98 * time.Millisecond
 )
 

@@ -4,9 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
-	"math"
-	"math/rand"
 	"net/http"
 	"time"
 
@@ -16,52 +15,39 @@ import (
 )
 
 type AdaptiveRouter struct {
-	KalmanDefault  *KalmanFilter
-	PIDDefault     *PIDController
-	KalmanFallback *KalmanFilter
-	PIDFallback    *PIDController
-	agg            *storage.RedisAggregator
-
-	Client  *http.Client
-	Workers int
-	Queue   *PriorityQueue
-	Done    chan struct{}
+	agg     *storage.RedisAggregator
+	client  *http.Client
+	workers int
+	queue   *PriorityQueue
+	done    chan struct{}
 }
 
 func NewAdaptiveRouter(
-	kD *KalmanFilter,
-	pD *PIDController,
-	kF *KalmanFilter,
-	pF *PIDController,
 	workers int,
 	agg *storage.RedisAggregator,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
-		KalmanDefault:  kD,
-		PIDDefault:     pD,
-		KalmanFallback: kF,
-		PIDFallback:    pF,
-		Client:         &http.Client{Timeout: 2 * time.Second},
-		Workers:        workers,
-		Queue:          NewPriorityQueue(),
-		Done:           make(chan struct{}),
-		agg:            agg,
+		client:  &http.Client{Timeout: 2 * time.Second},
+		workers: workers,
+		queue:   NewPriorityQueue(),
+		done:    make(chan struct{}),
+		agg:     agg,
 	}
 }
 
 func (ar *AdaptiveRouter) Start(ctx context.Context) {
-	for i := 0; i < ar.Workers; i++ {
+	for i := 0; i < ar.workers; i++ {
 		go func() {
 			for {
 				select {
-				case <-ar.Done:
+				case <-ar.done:
 					return
 				default:
-					br := ar.Queue.Pop()
+					br := ar.queue.Pop()
 					if br == nil {
 						continue
 					}
-					ar.handleBatch(br)
+					go ar.handleBatch(br)
 				}
 			}
 		}()
@@ -69,34 +55,8 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 }
 
 func (ar *AdaptiveRouter) handleBatch(br *batchRequest) {
-	healthDefault := ar.KalmanDefault.Estimate()
-	healthFallback := ar.KalmanFallback.Estimate()
-
-	penaltyDefault := math.Max(0, ar.PIDDefault.Compute(healthDefault))
-	penaltyFallback := math.Max(0, ar.PIDFallback.Compute(healthFallback))
-
-	costDefault := 0.05
-	costFallback := 0.15
-
-	scoreDefault := 1.0 / (1.0 + penaltyDefault + costDefault)
-	scoreFallback := 1.0 / (1.0 + penaltyFallback + costFallback)
-
-	totalScore := scoreDefault + scoreFallback
-	if totalScore == 0 {
-		if br.Priority < 1000 {
-			br.Priority++
-			ar.Queue.Push(br)
-		}
-		return
-	}
-
-	fracDefault := scoreDefault / totalScore
 	var target func(*payments.PaymentsPayload) bool
-	if rand.Float64() < fracDefault {
-		target = ar.sendToDefault
-	} else {
-		target = ar.sendToFallback
-	}
+	target = ar.sendToDefault
 
 	failedPayloads := make([]*payments.PaymentsPayload, 0)
 
@@ -107,47 +67,46 @@ func (ar *AdaptiveRouter) handleBatch(br *batchRequest) {
 	}
 
 	if len(failedPayloads) > 0 {
-		if br.Priority < 1000 {
+		if br.Priority < 10 {
 			failedBatch := &batchRequest{
 				Requests: failedPayloads,
 				Priority: br.Priority + 1,
 			}
-			ar.Queue.Push(failedBatch)
+			ar.queue.Push(failedBatch)
+		} else {
+			fmt.Println("batch discarded 2")
 		}
 	}
 }
 
 func (ar *AdaptiveRouter) Stop() {
-	close(ar.Done)
+	close(ar.done)
 }
 
 func (ar *AdaptiveRouter) EnqueueBatch(reqs []*payments.PaymentsPayload, priority int) {
 	br := &batchRequest{Requests: reqs, Priority: priority}
-	ar.Queue.Push(br)
+	ar.queue.Push(br)
 }
 
 func (ar *AdaptiveRouter) sendToDefault(payload *payments.PaymentsPayload) bool {
 	return ar.sendRequest(
 		config.PAYMENTS_PROCESSOR_URL_DEFAULT,
-		"default",
+		payments.DefaultProcessor,
 		payload,
-		ar.KalmanDefault,
 	)
 }
 
 func (ar *AdaptiveRouter) sendToFallback(payload *payments.PaymentsPayload) bool {
 	return ar.sendRequest(
 		config.PAYMENTS_PROCESSOR_URL_FALLBACK,
-		"fallback",
+		payments.FallbackProcessor,
 		payload,
-		ar.KalmanFallback,
 	)
 }
 
 func (ar *AdaptiveRouter) sendRequest(
 	url, processorName string,
 	payload *payments.PaymentsPayload,
-	kf *KalmanFilter,
 ) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -163,7 +122,7 @@ func (ar *AdaptiveRouter) sendRequest(
 	req.Header.Set("Content-Type", "application/json")
 
 	startTime := time.Now()
-	resp, err := ar.Client.Do(req)
+	resp, err := ar.client.Do(req)
 	latency := time.Since(startTime).Seconds()
 
 	var measuredState State
@@ -177,9 +136,6 @@ func (ar *AdaptiveRouter) sendRequest(
 	} else {
 		measuredState.ErrorRate = 1.0
 	}
-
-	kf.Predict()
-	kf.Update(measuredState, kf.R)
 
 	if resp != nil {
 		resp.Body.Close()

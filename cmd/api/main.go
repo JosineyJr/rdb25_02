@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -37,34 +38,8 @@ func main() {
 		logger.Fatal().Err(err).Msg("Unable to connect to Redis")
 	}
 
-	kfDefault := routing.NewKalmanFilter(
-		routing.State{Latency: 0.01, ErrorRate: 0.0},
-		[2][2]float64{{1, 0}, {0, 1}},
-		[2][2]float64{{0.01, 0}, {0, 0.01}},
-		[2][2]float64{{0.1, 0}, {0, 0.1}},
-	)
-	pidDefault := routing.NewPIDController(
-		-1.0,
-		-0.5,
-		0.0,
-		routing.State{Latency: 0.9, ErrorRate: 0.2},
-	)
-	kfFallback := routing.NewKalmanFilter(
-		routing.State{Latency: 0.05, ErrorRate: 0.0},
-		[2][2]float64{{1, 0}, {0, 1}},
-		[2][2]float64{{0.01, 0}, {0, 0.01}},
-		[2][2]float64{{0.1, 0}, {0, 0.1}},
-	)
-	pidFallback := routing.NewPIDController(
-		1.0,
-		0.1,
-		0.0,
-		routing.State{Latency: 0.2, ErrorRate: 0.0},
-	)
 	ar := routing.NewAdaptiveRouter(
-		kfDefault, pidDefault,
-		kfFallback, pidFallback,
-		10,
+		runtime.NumCPU()*2,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
