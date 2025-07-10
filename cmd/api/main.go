@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"os"
 	"os/signal"
 	"runtime"
@@ -41,7 +42,7 @@ func main() {
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		6,
+		125,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
@@ -77,7 +78,7 @@ func main() {
 	server := &fasthttp.Server{
 		Handler:           requestHandler,
 		Name:              "PaymentService",
-		Concurrency:       512,
+		Concurrency:       1536,
 		ReduceMemoryUsage: true,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -131,6 +132,7 @@ func handleCreatePayment(
 	case <-ticker.C:
 		logger.Warn().Msg("worker pool saturated. Rejecting request with 503.")
 		ctx.Error("Service Unavailable", fasthttp.StatusServiceUnavailable)
+		return
 	}
 
 	ctx.SetStatusCode(fasthttp.StatusAccepted)
@@ -141,12 +143,31 @@ func handlePaymentsSummary(
 	logger *zerolog.Logger,
 	aggregator *storage.RedisAggregator,
 ) {
-	defaultData, fallbackData, err := aggregator.GetSummary(context.Background())
+	var from, to *time.Time
+
+	fromStr := string(ctx.QueryArgs().Peek("from"))
+	if fromStr != "" {
+		if t, err := time.Parse(time.RFC3339Nano, fromStr); err == nil {
+			from = &t
+		}
+	}
+
+	toStr := string(ctx.QueryArgs().Peek("to"))
+	if toStr != "" {
+		if t, err := time.Parse(time.RFC3339Nano, toStr); err == nil {
+			to = &t
+		}
+	}
+
+	defaultData, fallbackData, err := aggregator.GetSummary(ctx, from, to)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get summary from Redis")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 		return
 	}
+
+	defaultData.Total = math.Round(defaultData.Total*10) / 10
+	fallbackData.Total = math.Round(fallbackData.Total*10) / 10
 
 	respBody, err := json.Marshal(payments.PaymentsSummary{
 		Default:  defaultData,

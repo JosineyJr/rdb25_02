@@ -24,9 +24,8 @@ const (
 )
 
 const (
-	failureThreshold         = 15
-	openStateTimeout         = 5 * time.Second
-	absoluteLatencyThreshold = 0.250
+	failureThreshold = 15
+	openStateTimeout = 5 * time.Second
 )
 
 type AdaptiveRouter struct {
@@ -50,7 +49,7 @@ func NewAdaptiveRouter(
 	return &AdaptiveRouter{
 		client:          &fasthttp.Client{},
 		workers:         workers,
-		PayloadChan:     make(chan *payments.PaymentsPayload, 5196),
+		PayloadChan:     make(chan *payments.PaymentsPayload, 10240),
 		done:            make(chan struct{}),
 		agg:             agg,
 		cbState:         StateClosed,
@@ -80,10 +79,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case p := <-ar.PayloadChan:
-					targetFunc, processorName, choose := ar.chooseProcessor()
-					if !choose {
-						continue
-					}
+					targetFunc, processorName := ar.chooseProcessor()
 
 					success := targetFunc(p)
 
@@ -98,7 +94,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 	}
 }
 
-func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string, sent bool) {
+func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string) {
 	ar.cbMutex.RLock()
 	defer ar.cbMutex.RUnlock()
 
@@ -106,27 +102,19 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPaylo
 		if time.Since(ar.cbLastOpenTime) > openStateTimeout {
 			ar.cbState = StateHalfOpen
 		} else {
-			return ar.sendToFallback, payments.FallbackProcessor, true
+			return ar.sendToFallback, payments.FallbackProcessor
 		}
 	}
 
 	if ar.cbState == StateHalfOpen {
-		return ar.sendToDefault, payments.DefaultProcessor, true
+		return ar.sendToDefault, payments.DefaultProcessor
 	}
 
-	if ar.defaultLatency < absoluteLatencyThreshold {
-		return ar.sendToDefault, payments.DefaultProcessor, true
+	if ar.fallbackLatency > 0 && ar.defaultLatency > (4*ar.fallbackLatency) {
+		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
-	if ar.fallbackLatency >= 3 || ar.defaultLatency >= 3 {
-		return nil, "", false
-	}
-
-	if ar.fallbackLatency > 0 && ar.defaultLatency > (5*ar.fallbackLatency) {
-		return ar.sendToFallback, payments.FallbackProcessor, true
-	}
-
-	return ar.sendToDefault, payments.DefaultProcessor, true
+	return ar.sendToDefault, payments.DefaultProcessor
 }
 
 func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool) {
@@ -207,7 +195,7 @@ func (ar *AdaptiveRouter) sendRequest(
 	}
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
-		ar.agg.Update(context.Background(), processorName, payload.Amount)
+		ar.agg.Update(context.Background(), processorName, payload)
 		return true
 	}
 
