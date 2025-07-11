@@ -42,7 +42,7 @@ func main() {
 	logger.Info().Int("numCPU", runtime.NumCPU()).Send()
 
 	ar := routing.NewAdaptiveRouter(
-		runtime.NumCPU()*32,
+		6,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
