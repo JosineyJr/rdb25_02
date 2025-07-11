@@ -24,7 +24,6 @@ func init() {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -38,11 +37,12 @@ func main() {
 		"payments-summary",
 	)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to connect to Redis")
+		logger.Fatal().Err(err).Msg("unable to connect to Redis")
 	}
+	logger.Info().Int("numCPU", runtime.NumCPU()).Send()
 
 	ar := routing.NewAdaptiveRouter(
-		75,
+		runtime.NumCPU()*32,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
@@ -64,7 +64,7 @@ func main() {
 			} else {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
-		case "/admin/purge-payments":
+		case "/purge-payments":
 			if reqCtx.IsPost() {
 				handlePurgePayments(reqCtx, &logger, summaryAggregator)
 			} else {
@@ -124,18 +124,15 @@ func handleCreatePayment(
 	}
 	payload.RequestedAt = time.Now().UTC()
 
-	ticker := time.NewTicker(45 * time.Millisecond)
-
 	select {
 	case router.PayloadChan <- &payload:
 		ctx.SetStatusCode(fasthttp.StatusAccepted)
-	case <-ticker.C:
-		logger.Warn().Msg("worker pool saturated. Rejecting request with 503.")
+		return
+	default:
+		// logger.Warn().Msg("worker pool saturated. Rejecting request with 503.")
 		ctx.Error("Service Unavailable", fasthttp.StatusServiceUnavailable)
 		return
 	}
-
-	ctx.SetStatusCode(fasthttp.StatusAccepted)
 }
 
 func handlePaymentsSummary(

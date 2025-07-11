@@ -10,7 +10,7 @@ A Skynet programou esta unidade com três diretivas primárias:
 
   * `POST /payments`: Identificar e adquirir alvos (`payments`), enviando-os para terminação (processamento) assíncrona. A I.A. de roteamento decide a melhor abordagem tática (`default` ou `fallback`) para garantir a eficiência da missão.
   * `GET /payments-summary`: Gerar um relatório de campo sobre os alvos terminados, detalhando o sucesso de cada processador. A análise pode ser feita em qualquer linha do tempo (`from` e `to`).
-  * `POST /admin/purge-payments`: Apagar a linha do tempo, reiniciando os registros de combate no Redis para uma nova simulação tática.
+  * `POST /purge-payments`: Apagar a linha do tempo, reiniciando os registros de combate no Redis para uma nova simulação tática.
 
 ## ⚙️ Arsenal Tecnológico (Cyberdyne Systems)
 
@@ -58,7 +58,7 @@ A Skynet programou esta unidade com três diretivas primárias:
 }
 ```
 
-### POST /admin/purge-payments
+### POST /purge-payments
 
 **Resposta (Status 204 No Content):** *“Hasta la vista, baby.”* Os dados foram apagados. A linha do tempo está limpa para o próximo ataque.
 

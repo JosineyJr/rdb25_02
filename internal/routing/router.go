@@ -50,7 +50,7 @@ func NewAdaptiveRouter(
 	ar := &AdaptiveRouter{
 		client:      &fasthttp.Client{},
 		workers:     workers,
-		PayloadChan: make(chan *payments.PaymentsPayload, 10240),
+		PayloadChan: make(chan *payments.PaymentsPayload, 11264),
 		done:        make(chan struct{}),
 		agg:         agg,
 		cbMutex:     sync.RWMutex{},
@@ -118,7 +118,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPaylo
 	defLatency := math.Float64frombits(ar.defaultLatency.Load())
 	fallLatency := math.Float64frombits(ar.fallbackLatency.Load())
 
-	if fallLatency > 0 && defLatency > (4*fallLatency) {
+	if fallLatency > 0 && defLatency > (3*fallLatency) {
 		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
