@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -12,145 +11,241 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type RedisAggregator struct {
+type RedisDB struct {
 	client *redis.Client
-	key    string
 }
 
 const (
-	defaultTimeSeriesKey  = "ts:default"
-	fallbackTimeSeriesKey = "ts:fallback"
+	tsDefaultAmountKey   = "ts:amount:default"
+	tsDefaultCountKey    = "ts:count:default"
+	tsFallbackAmountKey  = "ts:amount:fallback"
+	tsFallbackCountKey   = "ts:count:fallback"
+	processedPaymentsKey = "payments:processed"
 )
 
-func NewRedisAggregator(redisURL, redisSocket, key string) (*RedisAggregator, error) {
-	var client *redis.Client
+func NewRedisDB(redisURL, redisSocket, key string) (*RedisDB, error) {
+	if redisURL == "" {
+		return nil, fmt.Errorf("REDIS_URL must be set")
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	opts.Protocol = 2
+	client := redis.NewClient(opts)
+	ctx := context.Background()
 
-	if redisSocket != "" {
-		client = redis.NewClient(&redis.Options{
-			Network: "unix",
-			Addr:    redisSocket,
-		})
-	} else {
-		if redisURL == "" {
-			return nil, fmt.Errorf("REDIS_SOCKET or REDIS_URL must be set")
-		}
-
-		opts, err := redis.ParseURL(redisURL)
-		if err != nil {
-			return nil, err
-		}
-		client = redis.NewClient(opts)
+	r := &RedisDB{client: client}
+	if err = r.createKeys(ctx); err != nil {
+		return nil, err
 	}
 
-	return &RedisAggregator{client: client, key: key}, nil
+	return r, nil
 }
 
-func (a *RedisAggregator) Update(
+func splitLabels(labelStr string) []string {
+	return strings.Fields(labelStr)
+}
+
+func splitKeyVal(s string) [2]string {
+	parts := strings.SplitN(s, "=", 2)
+	return [2]string{parts[0], parts[1]}
+}
+
+func isAlreadyExistsError(err error) bool {
+	return err != nil && (strings.Contains(err.Error(), "ERR TSDB: key already exists") ||
+		strings.Contains(err.Error(), "BUSYKEY Target key name already exists"))
+}
+
+func (a *RedisDB) PaymentIsProcessed(ctx context.Context, id string) bool {
+	val, err := a.client.SIsMember(ctx, processedPaymentsKey, id).Result()
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+
+	return val
+}
+
+func (a *RedisDB) MarkAsProcessed(ctx context.Context, id string) {
+	_, err := a.client.SAdd(ctx, processedPaymentsKey, id).Result()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+}
+
+func (a *RedisDB) Update(
 	ctx context.Context,
 	processor string,
 	payload *payments.PaymentsPayload,
 ) {
 	pipe := a.client.Pipeline()
+	timestamp := payload.RequestedAt.UnixMilli()
 
-	amountInCents := int64(math.Round(payload.Amount * 100))
-
-	pipe.HIncrBy(ctx, a.key, processor+"_total_cents", amountInCents)
-
-	var tsKey string
+	var amountKey, countKey string
 	if processor == payments.DefaultProcessor {
-		tsKey = defaultTimeSeriesKey
+		amountKey = tsDefaultAmountKey
+		countKey = tsDefaultCountKey
 	} else {
-		tsKey = fallbackTimeSeriesKey
+		amountKey = tsFallbackAmountKey
+		countKey = tsFallbackCountKey
 	}
 
-	score := float64(payload.RequestedAt.UnixMilli())
-	var sb strings.Builder
-	sb.WriteString(payload.CorrelationID)
-	sb.WriteString(":")
-	sb.WriteString(strconv.Itoa(int(amountInCents)))
-	pipe.ZAdd(ctx, tsKey, redis.Z{Score: score, Member: sb.String()})
+	pipe.Do(ctx, "TS.ADD", amountKey, timestamp, payload.Amount, "ON_DUPLICATE", "SUM")
+	pipe.Do(ctx, "TS.ADD", countKey, timestamp, 1, "ON_DUPLICATE", "SUM")
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		fmt.Printf("failed to update redis aggregator: %v\n", err)
-		return
 	}
 }
 
-func (a *RedisAggregator) GetSummary(
+func (a *RedisDB) GetSummary(
 	ctx context.Context, from, to *time.Time,
 ) (payments.SummaryData, payments.SummaryData, error) {
-	if from == nil || to == nil {
-		data, err := a.client.HGetAll(ctx, a.key).Result()
-		if err != nil {
-			return payments.SummaryData{}, payments.SummaryData{}, err
-		}
+	var defaultSummary, fallbackSummary payments.SummaryData
 
-		defaultCents := parseInt(data["default_total_cents"])
-		fallbackCents := parseInt(data["fallback_total_cents"])
-
-		defaultSummary := payments.SummaryData{
-			Count: parseInt(data["default_count"]),
-			Total: float64(defaultCents) / 100.0,
-		}
-		fallbackSummary := payments.SummaryData{
-			Count: parseInt(data["fallback_count"]),
-			Total: float64(fallbackCents) / 100.0,
-		}
-		return defaultSummary, fallbackSummary, nil
+	bucket := to.UnixMilli() - from.UnixMilli()
+	if bucket <= 0 {
+		bucket = 1
 	}
 
-	min := strconv.FormatInt(from.UnixMilli(), 10)
-	max := strconv.FormatInt(to.UnixMilli(), 10)
-
-	pipe := a.client.Pipeline()
-	defaultResult := pipe.ZRangeByScore(
-		ctx,
-		defaultTimeSeriesKey,
-		&redis.ZRangeBy{Min: min, Max: max},
-	)
-	fallbackResult := pipe.ZRangeByScore(
-		ctx,
-		fallbackTimeSeriesKey,
-		&redis.ZRangeBy{Min: min, Max: max},
-	)
-	_, err := pipe.Exec(ctx)
+	result, err := a.client.Do(ctx,
+		"TS.MRANGE",
+		from.UnixMilli(), to.UnixMilli(),
+		"AGGREGATION", "sum", bucket,
+		"FILTER", "type=amount",
+	).Slice()
 	if err != nil {
-		return payments.SummaryData{}, payments.SummaryData{}, err
+		return defaultSummary, fallbackSummary, fmt.Errorf("failed TS.MRANGE (amount): %w", err)
 	}
 
-	defaultCents := parseZRangeResultCents(defaultResult.Val())
-	fallbackCents := parseZRangeResultCents(fallbackResult.Val())
+	for _, serie := range result {
+		serieData, ok := serie.([]interface{})
+		if !ok || len(serieData) != 3 {
+			continue
+		}
 
-	defaultSummary := payments.SummaryData{
-		Count: int64(len(defaultResult.Val())),
-		Total: float64(defaultCents) / 100.0,
+		key, _ := serieData[0].(string)
+		points, ok := serieData[2].([]interface{})
+		if !ok {
+			continue
+		}
+
+		var sum float64
+		for _, point := range points {
+			entry, ok := point.([]interface{})
+			if !ok || len(entry) != 2 {
+				continue
+			}
+			valStr, ok := entry[1].(string)
+			if !ok {
+				continue
+			}
+			val, err := parseFloat(valStr)
+			if err != nil {
+				continue
+			}
+			sum += val
+		}
+
+		switch key {
+		case tsDefaultAmountKey:
+			defaultSummary.Total = sum
+		case tsFallbackAmountKey:
+			fallbackSummary.Total = sum
+		}
 	}
-	fallbackSummary := payments.SummaryData{
-		Count: int64(len(fallbackResult.Val())),
-		Total: float64(fallbackCents) / 100.0,
+
+	result, err = a.client.Do(ctx,
+		"TS.MRANGE",
+		from.UnixMilli(), to.UnixMilli(),
+		"AGGREGATION", "sum", bucket,
+		"FILTER", "type=count",
+	).Slice()
+	if err != nil {
+		return defaultSummary, fallbackSummary, fmt.Errorf("failed TS.MRANGE (count): %w", err)
+	}
+
+	for _, serie := range result {
+		serieData, ok := serie.([]interface{})
+		if !ok || len(serieData) != 3 {
+			continue
+		}
+
+		key, _ := serieData[0].(string)
+		points, ok := serieData[2].([]interface{})
+		if !ok {
+			continue
+		}
+
+		var sum int64
+		for _, point := range points {
+			entry, ok := point.([]interface{})
+			if !ok || len(entry) != 2 {
+				continue
+			}
+			valStr, ok := entry[1].(string)
+			if !ok {
+				continue
+			}
+			val, err := parseInt(valStr)
+			if err != nil {
+				continue
+			}
+			sum += val
+		}
+
+		switch key {
+		case tsDefaultCountKey:
+			defaultSummary.Count = sum
+		case tsFallbackCountKey:
+			fallbackSummary.Count = sum
+		}
 	}
 
 	return defaultSummary, fallbackSummary, nil
 }
 
-func parseZRangeResultCents(results []string) int64 {
-	var totalCents int64
-	for _, member := range results {
-		parts := strings.Split(member, ":")
-		if len(parts) == 2 {
-			cents, _ := strconv.ParseInt(parts[1], 10, 64)
-			totalCents += cents
+func (a *RedisDB) createKeys(ctx context.Context) error {
+	labels := map[string]string{
+		tsDefaultAmountKey:  "processor=default type=amount",
+		tsDefaultCountKey:   "processor=default type=count",
+		tsFallbackAmountKey: "processor=fallback type=amount",
+		tsFallbackCountKey:  "processor=fallback type=count",
+	}
+
+	for key, labelStr := range labels {
+		args := []interface{}{"TS.CREATE", key, "DUPLICATE_POLICY", "SUM", "LABELS"}
+		for _, label := range splitLabels(labelStr) {
+			parts := splitKeyVal(label)
+			args = append(args, parts[0], parts[1])
+		}
+		_, err := a.client.Do(ctx, args...).Result()
+		if err != nil && !isAlreadyExistsError(err) {
+			return fmt.Errorf("error creating timeseries %s: %w", key, err)
 		}
 	}
-	return totalCents
+
+	return nil
 }
 
-func (a *RedisAggregator) PurgeSummary(ctx context.Context) error {
-	return a.client.Del(ctx, a.key, defaultTimeSeriesKey, fallbackTimeSeriesKey).Err()
+func (a *RedisDB) PurgeSummary(ctx context.Context) error {
+	if err := a.client.Del(ctx,
+		tsDefaultAmountKey, tsDefaultCountKey,
+		tsFallbackAmountKey, tsFallbackCountKey, processedPaymentsKey,
+	).Err(); err != nil {
+		return err
+	}
+
+	return a.createKeys(ctx)
 }
 
-func parseInt(s string) int64 {
-	i, _ := strconv.ParseInt(s, 10, 64)
-	return i
+func parseFloat(s string) (float64, error) {
+	return strconv.ParseFloat(s, 64)
+}
+
+func parseInt(s string) (int64, error) {
+	return strconv.ParseInt(s, 10, 64)
 }

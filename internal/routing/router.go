@@ -31,7 +31,7 @@ const (
 
 type AdaptiveRouter struct {
 	cbLastOpenTime  time.Time
-	agg             *storage.RedisAggregator
+	agg             *storage.RedisDB
 	client          *fasthttp.Client
 	PayloadChan     chan *payments.PaymentsPayload
 	workers         int
@@ -44,7 +44,7 @@ type AdaptiveRouter struct {
 
 func NewAdaptiveRouter(
 	workers int,
-	agg *storage.RedisAggregator,
+	agg *storage.RedisDB,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
 		client:          &fasthttp.Client{},
@@ -78,21 +78,28 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case p := <-ar.PayloadChan:
+					if ar.agg.PaymentIsProcessed(ctx, p.CorrelationID) {
+						continue
+					}
+
 					targetFunc, processorName := ar.chooseProcessor()
-					success := targetFunc(p)
+					success := targetFunc(ctx, p)
 
 					ar.updateCircuitState(processorName, success)
 
 					if !success {
 						ar.PayloadChan <- p
+						continue
 					}
+
+					ar.agg.MarkAsProcessed(ctx, p.CorrelationID)
 				}
 			}
 		}()
 	}
 }
 
-func (ar *AdaptiveRouter) chooseProcessor() (target func(*payments.PaymentsPayload) bool, processorName string) {
+func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payments.PaymentsPayload) bool, processorName string) {
 	ar.cbMutex.RLock()
 	defer ar.cbMutex.RUnlock()
 
@@ -155,16 +162,24 @@ func (ar *AdaptiveRouter) openCircuit() {
 	ar.cbLastOpenTime = time.Now()
 }
 
-func (ar *AdaptiveRouter) sendToDefault(payload *payments.PaymentsPayload) bool {
+func (ar *AdaptiveRouter) sendToDefault(
+	ctx context.Context,
+	payload *payments.PaymentsPayload,
+) bool {
 	return ar.sendRequest(
+		ctx,
 		config.PAYMENTS_PROCESSOR_URL_DEFAULT,
 		payments.DefaultProcessor,
 		payload,
 	)
 }
 
-func (ar *AdaptiveRouter) sendToFallback(payload *payments.PaymentsPayload) bool {
+func (ar *AdaptiveRouter) sendToFallback(
+	ctx context.Context,
+	payload *payments.PaymentsPayload,
+) bool {
 	return ar.sendRequest(
+		ctx,
 		config.PAYMENTS_PROCESSOR_URL_FALLBACK,
 		payments.FallbackProcessor,
 		payload,
@@ -172,6 +187,7 @@ func (ar *AdaptiveRouter) sendToFallback(payload *payments.PaymentsPayload) bool
 }
 
 func (ar *AdaptiveRouter) sendRequest(
+	ctx context.Context,
 	url, processorName string,
 	payload *payments.PaymentsPayload,
 ) bool {
@@ -198,7 +214,7 @@ func (ar *AdaptiveRouter) sendRequest(
 	}
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
-		ar.agg.Update(context.Background(), processorName, payload)
+		ar.agg.Update(ctx, processorName, payload)
 		return true
 	}
 

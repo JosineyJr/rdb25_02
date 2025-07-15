@@ -32,7 +32,7 @@ func main() {
 		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
 	).Level(zerolog.TraceLevel).With().Timestamp().Caller().Logger()
 
-	summaryAggregator, err := storage.NewRedisAggregator(
+	summaryAggregator, err := storage.NewRedisDB(
 		os.Getenv("REDIS_URL"),
 		os.Getenv("REDIS_SOCKET"),
 		"payments-summary",
@@ -59,6 +59,12 @@ func main() {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
 		case "/payments-summary":
+			now := time.Now()
+
+			defer func(n time.Time) {
+				logger.Info().Msgf("get summary took- %s", time.Since(n))
+			}(now)
+
 			if reqCtx.IsGet() {
 				handlePaymentsSummary(reqCtx, &logger, summaryAggregator)
 			} else {
@@ -133,7 +139,7 @@ func handleCreatePayment(
 func handlePaymentsSummary(
 	ctx *fasthttp.RequestCtx,
 	logger *zerolog.Logger,
-	aggregator *storage.RedisAggregator,
+	aggregator *storage.RedisDB,
 ) {
 	var from, to *time.Time
 
@@ -179,7 +185,7 @@ func handlePaymentsSummary(
 func handlePurgePayments(
 	ctx *fasthttp.RequestCtx,
 	logger *zerolog.Logger,
-	aggregator *storage.RedisAggregator,
+	aggregator *storage.RedisDB,
 ) {
 	err := aggregator.PurgeSummary(ctx)
 	if err != nil {

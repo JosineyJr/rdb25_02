@@ -21,69 +21,59 @@ services:
           cpus: "0.15"
           memory: "60MB"
 
-  api1:
+  api1: &api
     image: josiney/rdb25_02-arm64:latest 
-    container_name: rinha-api-1
     hostname: api1
     networks:
       - backend
       - payment-processor 
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
-      - REDIS_SOCKET=/var/run/redis/redis.sock
+      - REDIS_URL=redis://redis:6379/0
       - PORT=9997
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    volumes:
-      - redis-socket:/var/run/redis
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.6"
           memory: "40MB"
 
   api2:
-    image: josiney/rdb25_02-arm64:latest
-    container_name: rinha-api-2
+    <<: *api
     hostname: api2
-    networks:
-      - backend
-      - payment-processor
-    depends_on:
-      - redis
     environment:
-      - REDIS_SOCKET=/var/run/redis/redis.sock
+      - REDIS_URL=redis://redis:6379/0
       - PORT=9998
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    volumes:
-      - redis-socket:/var/run/redis
-    deploy:
-      resources:
-        limits:
-          cpus: "0.3"
-          memory: "40MB"
 
   redis:
-    image: redis:7.2-alpine
-    container_name: rinha-redis
+    image: redis/redis-stack:7.2.0-v18
+    hostname: rinha-redis
+    environment:
+      - REDISTIMESERIES_ARGS=DUPLICATE_POLICY=SUM
     networks:
       - backend
     ports:
       - "6379:6379"
-    volumes:
-      - redis-socket:/var/run/redis
-    command: sh -c "chown redis:redis /var/run/redis && redis-server --unixsocket /var/run/redis/redis.sock --unixsocketperm 777"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     deploy:
       resources:
         limits:
-          cpus: "0.15"
-          memory: "20MB"
+          cpus: "0.3"
+          memory: "25MB" 
 
 networks:
   backend:
@@ -91,7 +81,3 @@ networks:
     driver: bridge
   payment-processor:
     external: true 
-
-volumes:
-  data_sql:
-  redis-socket:
