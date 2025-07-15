@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"os"
 	"os/signal"
 	"runtime"
@@ -63,7 +64,7 @@ func main() {
 			} else {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
-		case "/admin/purge-payments":
+		case "/purge-payments":
 			if reqCtx.IsPost() {
 				handlePurgePayments(reqCtx, &logger, summaryAggregator)
 			} else {
@@ -75,13 +76,13 @@ func main() {
 	}
 
 	server := &fasthttp.Server{
-		Handler:           requestHandler,
-		Name:              "PaymentService",
-		Concurrency:       512,
-		ReduceMemoryUsage: true,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       10 * time.Second,
+		Handler: requestHandler,
+		Name:    "PaymentService",
+		// Concurrency: 2048,
+		// ReduceMemoryUsage: true,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  10 * time.Second,
 	}
 
 	go func() {
@@ -93,7 +94,6 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info().Msg("Shutdown signal received. Gracefully stopping server...")
-	ar.Stop()
 
 	if err := server.Shutdown(); err != nil {
 		logger.Error().Err(err).Msg("Server shutdown failed")
@@ -109,19 +109,13 @@ func handleCreatePayment(
 	logger *zerolog.Logger,
 	router *routing.AdaptiveRouter,
 ) {
-	var payload payments.PaymentsPayload
 
+	var payload payments.PaymentsPayload
 	if err := json.Unmarshal(ctx.PostBody(), &payload); err != nil {
 		ctx.Error("invalid request body", fasthttp.StatusBadRequest)
 		logger.Error().Err(err).Send()
 		return
 	}
-
-	if payload.Amount == 0.0 {
-		ctx.Error("missing field 'amount'", fasthttp.StatusBadRequest)
-		return
-	}
-	payload.RequestedAt = time.Now().UTC()
 
 	ticker := time.NewTicker(45 * time.Millisecond)
 
@@ -141,12 +135,31 @@ func handlePaymentsSummary(
 	logger *zerolog.Logger,
 	aggregator *storage.RedisAggregator,
 ) {
-	defaultData, fallbackData, err := aggregator.GetSummary(context.Background())
+	var from, to *time.Time
+
+	fromStr := string(ctx.QueryArgs().Peek("from"))
+	if fromStr != "" {
+		if t, err := time.Parse(time.RFC3339Nano, fromStr); err == nil {
+			from = &t
+		}
+	}
+
+	toStr := string(ctx.QueryArgs().Peek("to"))
+	if toStr != "" {
+		if t, err := time.Parse(time.RFC3339Nano, toStr); err == nil {
+			to = &t
+		}
+	}
+
+	defaultData, fallbackData, err := aggregator.GetSummary(ctx, from, to)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get summary from Redis")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 		return
 	}
+
+	defaultData.Total = math.Round(defaultData.Total*10) / 10
+	fallbackData.Total = math.Round(fallbackData.Total*10) / 10
 
 	respBody, err := json.Marshal(payments.PaymentsSummary{
 		Default:  defaultData,

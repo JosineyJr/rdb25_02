@@ -22,7 +22,7 @@ services:
           memory: "60MB"
 
   api1:
-    image: josiney/rdb25_02:latest 
+    image: josiney/rdb25_02-arm64:latest 
     container_name: rinha-api-1
     hostname: api1
     networks:
@@ -46,7 +46,7 @@ services:
           memory: "40MB"
 
   api2:
-    image: josiney/rdb25_02:latest
+    image: josiney/rdb25_02-arm64:latest
     container_name: rinha-api-2
     hostname: api2
     networks:

@@ -24,16 +24,15 @@ const (
 )
 
 const (
-	failureThreshold         = 15
+	failureThreshold         = 5
 	openStateTimeout         = 5 * time.Second
-	absoluteLatencyThreshold = 0.250
+	absoluteLatencyThreshold = 0.2
 )
 
 type AdaptiveRouter struct {
 	cbLastOpenTime  time.Time
 	agg             *storage.RedisAggregator
 	client          *fasthttp.Client
-	done            chan struct{}
 	PayloadChan     chan *payments.PaymentsPayload
 	workers         int
 	cbState         CircuitState
@@ -51,7 +50,6 @@ func NewAdaptiveRouter(
 		client:          &fasthttp.Client{},
 		workers:         workers,
 		PayloadChan:     make(chan *payments.PaymentsPayload, 5196),
-		done:            make(chan struct{}),
 		agg:             agg,
 		cbState:         StateClosed,
 		defaultLatency:  0.0,
@@ -187,6 +185,7 @@ func (ar *AdaptiveRouter) sendRequest(
 	req.Header.SetMethod(fasthttp.MethodPost)
 	req.Header.SetContentType("application/json")
 
+	payload.RequestedAt = time.Now().UTC()
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return false
@@ -199,13 +198,9 @@ func (ar *AdaptiveRouter) sendRequest(
 	}
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
-		ar.agg.Update(context.Background(), processorName, payload.Amount)
+		ar.agg.Update(context.Background(), processorName, payload)
 		return true
 	}
 
 	return false
-}
-
-func (ar *AdaptiveRouter) Stop() {
-	close(ar.done)
 }
