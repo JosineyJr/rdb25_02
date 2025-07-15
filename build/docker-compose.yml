@@ -19,7 +19,7 @@ services:
       resources:
         limits:
           cpus: "0.15"
-          memory: "60MB"
+          memory: "25MB"
 
   api1: &api
     image: josiney/rdb25_02-arm64:latest 
@@ -72,8 +72,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.3"
-          memory: "25MB" 
+          cpus: "0.15"
+          memory: "75MB" 
 
 networks:
   backend:

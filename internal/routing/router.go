@@ -49,7 +49,7 @@ func NewAdaptiveRouter(
 	return &AdaptiveRouter{
 		client:          &fasthttp.Client{},
 		workers:         workers,
-		PayloadChan:     make(chan *payments.PaymentsPayload, 5196),
+		PayloadChan:     make(chan *payments.PaymentsPayload, 6500),
 		agg:             agg,
 		cbState:         StateClosed,
 		defaultLatency:  0.0,
@@ -83,6 +83,12 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 					}
 
 					targetFunc, processorName := ar.chooseProcessor()
+					if targetFunc == nil {
+						ar.PayloadChan <- p
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+
 					success := targetFunc(ctx, p)
 
 					ar.updateCircuitState(processorName, success)
@@ -119,8 +125,16 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 		return ar.sendToDefault, payments.DefaultProcessor
 	}
 
-	if ar.fallbackLatency > 0 && ar.defaultLatency > (5*ar.fallbackLatency) {
+	if ar.fallbackLatency > 0 && ar.defaultLatency > (3*ar.fallbackLatency) {
+		if ar.fallbackLatency > 0.1 {
+			return nil, ""
+		}
+
 		return ar.sendToFallback, payments.FallbackProcessor
+	}
+
+	if ar.defaultLatency > 0.1 {
+		return nil, ""
 	}
 
 	return ar.sendToDefault, payments.DefaultProcessor
