@@ -63,8 +63,8 @@ func (hu *HealthUpdater) updateMetrics() {
 
 	wg.Wait()
 
-	defaultLatencySeconds := float64(defaultState.MinResponseTime) / 1000.0
-	fallbackLatencySeconds := float64(fallbackState.MinResponseTime) / 1000.0
+	defaultLatencySeconds := defaultState.MinResponseTime
+	fallbackLatencySeconds := fallbackState.MinResponseTime
 
 	hu.router.UpdateHealthMetrics(
 		defaultLatencySeconds,

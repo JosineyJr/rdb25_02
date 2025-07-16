@@ -2,7 +2,6 @@ package routing
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,18 +14,15 @@ import (
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
-type CircuitState int
-
 const (
-	StateClosed CircuitState = iota
-	StateOpen
-	StateHalfOpen
+	StateClosed   int32 = 0
+	StateOpen     int32 = 1
+	StateHalfOpen int32 = 2
 )
 
 const (
-	failureThreshold         = 5
-	openStateTimeout         = 5 * time.Second
-	absoluteLatencyThreshold = 0.2
+	failureThreshold = 15
+	openStateTimeout = 5 * time.Second
 )
 
 type AdaptiveRouter struct {
@@ -35,11 +31,10 @@ type AdaptiveRouter struct {
 	client          *fasthttp.Client
 	PayloadChan     chan *payments.PaymentsPayload
 	workers         int
-	cbState         CircuitState
+	cbState         atomic.Int32
 	cbFailures      atomic.Int32
-	defaultLatency  float64
-	fallbackLatency float64
-	cbMutex         sync.RWMutex
+	defaultLatency  atomic.Int32
+	fallbackLatency atomic.Int32
 }
 
 func NewAdaptiveRouter(
@@ -47,25 +42,21 @@ func NewAdaptiveRouter(
 	agg *storage.RedisDB,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
-		client:          &fasthttp.Client{},
-		workers:         workers,
-		PayloadChan:     make(chan *payments.PaymentsPayload, 6500),
-		agg:             agg,
-		cbState:         StateClosed,
-		defaultLatency:  0.0,
-		fallbackLatency: 0.0,
+		client:      &fasthttp.Client{},
+		workers:     workers,
+		PayloadChan: make(chan *payments.PaymentsPayload, 6500),
+		agg:         agg,
 	}
 }
 
 func (ar *AdaptiveRouter) UpdateHealthMetrics(
-	defaultLatency, fallbackLatency float64,
+	defaultLatency, fallbackLatency int,
 	isDefaultFailing bool,
 ) {
-	ar.cbMutex.Lock()
-	defer ar.cbMutex.Unlock()
-	ar.defaultLatency = defaultLatency
-	ar.fallbackLatency = fallbackLatency
-	if isDefaultFailing && ar.cbState != StateOpen {
+	ar.defaultLatency.Store(int32(defaultLatency))
+	ar.fallbackLatency.Store(int32(fallbackLatency))
+
+	if isDefaultFailing && ar.cbState.Load() != StateOpen {
 		ar.openCircuit()
 	}
 }
@@ -85,7 +76,6 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 					targetFunc, processorName := ar.chooseProcessor()
 					if targetFunc == nil {
 						ar.PayloadChan <- p
-						time.Sleep(100 * time.Millisecond)
 						continue
 					}
 
@@ -106,34 +96,36 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 }
 
 func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payments.PaymentsPayload) bool, processorName string) {
-	ar.cbMutex.RLock()
-	defer ar.cbMutex.RUnlock()
+	state := ar.cbState.Load()
 
-	if ar.cbState == StateOpen {
+	if state == StateOpen {
 		if time.Since(ar.cbLastOpenTime) > openStateTimeout {
-			ar.cbState = StateHalfOpen
+			ar.cbState.Store(StateHalfOpen)
 		} else {
 			return ar.sendToFallback, payments.FallbackProcessor
 		}
 	}
 
-	if ar.cbState == StateHalfOpen {
+	dl := ar.defaultLatency.Load()
+	fl := ar.fallbackLatency.Load()
+
+	if state == StateHalfOpen {
+		if dl > 100 {
+			return nil, ""
+		}
+
 		return ar.sendToDefault, payments.DefaultProcessor
 	}
 
-	if ar.defaultLatency < absoluteLatencyThreshold {
-		return ar.sendToDefault, payments.DefaultProcessor
-	}
-
-	if ar.fallbackLatency > 0 && ar.defaultLatency > (3*ar.fallbackLatency) {
-		if ar.fallbackLatency > 0.1 {
+	if fl > 0 && dl > (3*fl) {
+		if fl > 100 {
 			return nil, ""
 		}
 
 		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
-	if ar.defaultLatency > 0.1 {
+	if dl > 100 {
 		return nil, ""
 	}
 
@@ -144,10 +136,7 @@ func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool)
 	if processorName == payments.FallbackProcessor {
 		return
 	}
-	ar.cbMutex.Lock()
-	defer ar.cbMutex.Unlock()
-
-	if ar.cbState == StateHalfOpen {
+	if ar.cbState.Load() == StateHalfOpen {
 		if !success {
 			ar.openCircuit()
 		} else {
@@ -167,12 +156,12 @@ func (ar *AdaptiveRouter) updateCircuitState(processorName string, success bool)
 }
 
 func (ar *AdaptiveRouter) resetCircuit() {
-	ar.cbState = StateClosed
+	ar.cbState.Store(StateClosed)
 	ar.cbFailures.Store(0)
 }
 
 func (ar *AdaptiveRouter) openCircuit() {
-	ar.cbState = StateOpen
+	ar.cbState.Store(StateOpen)
 	ar.cbLastOpenTime = time.Now()
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"os/signal"
@@ -24,7 +25,6 @@ func init() {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -42,7 +42,7 @@ func main() {
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		6,
+		runtime.NumCPU()*5,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
@@ -122,18 +122,15 @@ func handleCreatePayment(
 		logger.Error().Err(err).Send()
 		return
 	}
-
-	ticker := time.NewTicker(45 * time.Millisecond)
+	ctx.SetStatusCode(fasthttp.StatusAccepted)
 
 	select {
 	case router.PayloadChan <- &payload:
 		ctx.SetStatusCode(fasthttp.StatusAccepted)
-	case <-ticker.C:
+	default:
 		logger.Warn().Msg("worker pool saturated. Rejecting request with 503.")
 		ctx.Error("Service Unavailable", fasthttp.StatusServiceUnavailable)
 	}
-
-	ctx.SetStatusCode(fasthttp.StatusAccepted)
 }
 
 func handlePaymentsSummary(
@@ -141,23 +138,19 @@ func handlePaymentsSummary(
 	logger *zerolog.Logger,
 	aggregator *storage.RedisDB,
 ) {
-	var from, to *time.Time
-
-	fromStr := string(ctx.QueryArgs().Peek("from"))
-	if fromStr != "" {
-		if t, err := time.Parse(time.RFC3339Nano, fromStr); err == nil {
-			from = &t
-		}
+	from, err := parseDate(string(ctx.QueryArgs().Peek("from")))
+	if err != nil {
+		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+		return
 	}
 
-	toStr := string(ctx.QueryArgs().Peek("to"))
-	if toStr != "" {
-		if t, err := time.Parse(time.RFC3339Nano, toStr); err == nil {
-			to = &t
-		}
+	to, err := parseDate(string(ctx.QueryArgs().Peek("to")))
+	if err != nil {
+		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+		return
 	}
 
-	defaultData, fallbackData, err := aggregator.GetSummary(ctx, from, to)
+	defaultData, fallbackData, err := aggregator.GetSummary(ctx, &from, &to)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get summary from Redis")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
@@ -195,4 +188,27 @@ func handlePurgePayments(
 	}
 
 	ctx.SetStatusCode(fasthttp.StatusNoContent)
+}
+
+func parseDate(date string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, date); err == nil {
+		return t, nil
+	}
+
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05Z07:00",
+	}
+
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, date); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("invalid date format: %s", date)
 }
