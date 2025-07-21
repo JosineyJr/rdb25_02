@@ -55,24 +55,21 @@ func main() {
 		case "/payments":
 			if reqCtx.IsPost() {
 				handleCreatePayment(reqCtx, &logger, ar)
+				return
 			} else {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
 		case "/payments-summary":
-			now := time.Now()
-
-			defer func(n time.Time) {
-				logger.Info().Msgf("get summary took- %s", time.Since(n))
-			}(now)
-
 			if reqCtx.IsGet() {
 				handlePaymentsSummary(reqCtx, &logger, summaryAggregator)
+				return
 			} else {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
 		case "/purge-payments":
 			if reqCtx.IsPost() {
 				handlePurgePayments(reqCtx, &logger, summaryAggregator)
+				return
 			} else {
 				reqCtx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 			}
@@ -138,14 +135,20 @@ func handlePaymentsSummary(
 	logger *zerolog.Logger,
 	aggregator *storage.RedisDB,
 ) {
+	defer func(n time.Time) {
+		logger.Info().Msgf("%d - get summary took - %s", ctx.Response.StatusCode(), time.Since(n))
+	}(time.Now())
+
 	from, err := parseDate(string(ctx.QueryArgs().Peek("from")))
 	if err != nil {
+		logger.Error().Err(err).Msg("Failed to parse 'from' date")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 		return
 	}
 
 	to, err := parseDate(string(ctx.QueryArgs().Peek("to")))
 	if err != nil {
+		logger.Error().Err(err).Msg("Failed to parse 'to' date")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 		return
 	}
