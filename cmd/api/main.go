@@ -29,8 +29,8 @@ func main() {
 	defer stop()
 
 	logger := zerolog.New(
-		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
-	).Level(zerolog.TraceLevel).With().Timestamp().Caller().Logger()
+		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano, NoColor: true},
+	).Level(zerolog.TraceLevel).With().Timestamp().Logger()
 
 	summaryAggregator, err := storage.NewRedisDB(
 		os.Getenv("REDIS_URL"),
@@ -136,17 +136,20 @@ func handlePaymentsSummary(
 	aggregator *storage.RedisDB,
 ) {
 	defer func(n time.Time) {
-		logger.Info().Msgf("%d - get summary took - %s", ctx.Response.StatusCode(), time.Since(n))
+		logger.Info().
+			Int("status_code", ctx.Response.StatusCode()).
+			Str("duration", time.Since(n).String()).
+			Msg("get summary")
 	}(time.Now())
 
-	from, err := parseDate(string(ctx.QueryArgs().Peek("from")))
+	from, err := parseDate(string(ctx.QueryArgs().Peek("from")), logger)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to parse 'from' date")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 		return
 	}
 
-	to, err := parseDate(string(ctx.QueryArgs().Peek("to")))
+	to, err := parseDate(string(ctx.QueryArgs().Peek("to")), logger)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to parse 'to' date")
 		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
@@ -193,7 +196,12 @@ func handlePurgePayments(
 	ctx.SetStatusCode(fasthttp.StatusNoContent)
 }
 
-func parseDate(date string) (time.Time, error) {
+func parseDate(date string, logger *zerolog.Logger) (time.Time, error) {
+	if date == "" {
+		logger.Warn().Msg("caught empty date")
+		date = time.Now().Format(time.RFC3339Nano)
+	}
+
 	if t, err := time.Parse(time.RFC3339Nano, date); err == nil {
 		return t, nil
 	}
