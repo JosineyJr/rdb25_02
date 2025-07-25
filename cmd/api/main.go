@@ -25,12 +25,11 @@ func init() {
 }
 
 func main() {
+	runtime.GOMAXPROCS(4)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger := zerolog.New(
-		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano, NoColor: true},
-	).Level(zerolog.TraceLevel).With().Timestamp().Logger()
+	logger := zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 
 	summaryAggregator, err := storage.NewRedisDB(
 		os.Getenv("REDIS_URL"),
@@ -42,7 +41,7 @@ func main() {
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		runtime.NumCPU()*5,
+		300,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
@@ -105,29 +104,27 @@ func main() {
 	logger.Info().Msg("Server stopped gracefully")
 }
 
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
+var json = jsoniter.ConfigFastest
 
 func handleCreatePayment(
 	ctx *fasthttp.RequestCtx,
 	logger *zerolog.Logger,
 	router *routing.AdaptiveRouter,
 ) {
+	defer func(n time.Time) {
+		since := time.Since(n)
+		if since < 10*time.Millisecond {
+			return
+		}
 
-	var payload payments.PaymentsPayload
-	if err := json.Unmarshal(ctx.PostBody(), &payload); err != nil {
-		ctx.Error("invalid request body", fasthttp.StatusBadRequest)
-		logger.Error().Err(err).Send()
-		return
-	}
+		logger.Info().
+			Int("status_code", ctx.Response.StatusCode()).
+			Str("duration", time.Since(n).String()).
+			Msg("create payment")
+	}(time.Now())
 	ctx.SetStatusCode(fasthttp.StatusAccepted)
 
-	select {
-	case router.PayloadChan <- &payload:
-		ctx.SetStatusCode(fasthttp.StatusAccepted)
-	default:
-		logger.Warn().Msg("worker pool saturated. Rejecting request with 503.")
-		ctx.Error("Service Unavailable", fasthttp.StatusServiceUnavailable)
-	}
+	router.BytesChan <- ctx.PostBody()
 }
 
 func handlePaymentsSummary(
@@ -211,7 +208,6 @@ func parseDate(date string, logger *zerolog.Logger) (time.Time, error) {
 		"2006-01-02",
 		"2006-01-02T15:04:05",
 		"2006-01-02T15:04:05Z",
-		"2006-01-02T15:04:05Z07:00",
 		"2006-01-02T15:04:05Z07:00",
 	}
 

@@ -23,7 +23,7 @@ func NewHealthUpdater(router *routing.AdaptiveRouter) *HealthUpdater {
 	return &HealthUpdater{
 		router: router,
 		client: &http.Client{},
-		ticker: time.NewTicker(7000 * time.Millisecond),
+		ticker: time.NewTicker(5 * time.Second),
 		done:   make(chan bool),
 	}
 }
@@ -39,7 +39,7 @@ func (hu *HealthUpdater) Start(ctx context.Context) {
 				return
 			case <-hu.ticker.C:
 				hu.updateMetrics()
-				hu.ticker.Reset(7000 * time.Millisecond)
+				hu.ticker.Reset(5 * time.Second)
 			}
 		}
 	}()
@@ -71,6 +71,7 @@ func (hu *HealthUpdater) updateMetrics() {
 		fallbackLatencySeconds,
 		defaultState.Failing,
 	)
+	hu.ticker.Reset(5 * time.Second)
 }
 
 func (hu *HealthUpdater) getHealthStatus(healthURL string) payments.ServiceHealthPayload {

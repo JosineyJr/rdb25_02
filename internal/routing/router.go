@@ -29,7 +29,8 @@ type AdaptiveRouter struct {
 	cbLastOpenTime  time.Time
 	agg             *storage.RedisDB
 	client          *fasthttp.Client
-	PayloadChan     chan *payments.PaymentsPayload
+	PayloadChan     chan payments.PaymentsPayload
+	BytesChan       chan []byte
 	workers         int
 	cbState         atomic.Int32
 	cbFailures      atomic.Int32
@@ -44,7 +45,8 @@ func NewAdaptiveRouter(
 	return &AdaptiveRouter{
 		client:      &fasthttp.Client{},
 		workers:     workers,
-		PayloadChan: make(chan *payments.PaymentsPayload, 6500),
+		PayloadChan: make(chan payments.PaymentsPayload, 6500),
+		BytesChan:   make(chan []byte, 6500),
 		agg:         agg,
 	}
 }
@@ -68,6 +70,12 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
+				case b := <-ar.BytesChan:
+					var payload payments.PaymentsPayload
+					if err := json.Unmarshal(b, &payload); err != nil {
+						continue
+					}
+					ar.PayloadChan <- payload
 				case p := <-ar.PayloadChan:
 					if ar.agg.PaymentIsProcessed(ctx, p.CorrelationID) {
 						continue
@@ -79,7 +87,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 						continue
 					}
 
-					success := targetFunc(ctx, p)
+					success := targetFunc(ctx, &p)
 
 					ar.updateCircuitState(processorName, success)
 
@@ -110,7 +118,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 	fl := ar.fallbackLatency.Load()
 
 	if state == StateHalfOpen {
-		if dl > 100 {
+		if dl > 80 {
 			return nil, ""
 		}
 
@@ -118,14 +126,14 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 	}
 
 	if fl > 0 && dl > (3*fl) {
-		if fl > 100 {
+		if fl > 20 {
 			return nil, ""
 		}
 
 		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
-	if dl > 100 {
+	if dl > 80 {
 		return nil, ""
 	}
 
