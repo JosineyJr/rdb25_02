@@ -1,13 +1,6 @@
 x-service-templates:
-  api: &api
-    build:
-      context: ../ 
-      dockerfile: ./build/Dockerfile
-    deploy:
-      resources:
-        limits:
-          cpus: "0.4"
-          memory: "50MB"
+  base: &base
+    image: josiney/rdb25_02-amd64:d1fefa11
     networks:
       - backend
       - payment-processor
@@ -17,8 +10,14 @@ x-service-templates:
 
 services:
   api1:
-    <<: *api
+    <<: *base
     container_name: api1
+    hostname: api1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "50MB"
     environment:
       - REDIS_URL=redis://redis-db:6379/0
       - PORT=9997
@@ -26,11 +25,17 @@ services:
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-
+    command: ./api
 
   api2:
-    <<: *api
+    <<: *base
     container_name: api2
+    hostname: api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "50MB"
     environment:
       - REDIS_URL=redis://redis-db:6379/0
       - PORT=9998
@@ -38,17 +43,40 @@ services:
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
+    command: ./api
+
+  worker1:
+    <<: *base
+    container_name: worker1
+    hostname: worker1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "50MB"
+    environment:
+      - REDIS_URL=redis://redis-db:6379/0
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
+    command: ./worker
 
   redis:
     image: redis/redis-stack:7.2.0-v18
     container_name: redis-db
-    environment:
-      - REDISTIMESERIES_ARGS=DUPLICATE_POLICY=SUM
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 250ms
       timeout: 2s
       retries: 10
+    command:
+      - redis-server
+      - --loadmodule /opt/redis-stack/lib/redistimeseries.so
+      - --appendonly no
+      - --maxmemory 50mb
+      - --save ""
+      - --protected-mode no
     networks:
       - backend
     ports:
@@ -56,15 +84,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
-          memory: "220MB" 
-  
-  nginx:
-    container_name: rinha-nginx
-    image: nginx:1.27.1-alpine
-    command: sh -c "sleep 5s && nginx -g 'daemon off;'"
+          cpus: "0.3"
+          memory: "50MB"
+
+  lb:
+    image: haproxy:latest
+    container_name: haproxy_lb
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     depends_on:
       - api1
       - api2
@@ -72,15 +99,14 @@ services:
       - "9999:9999"
     networks:
       - backend
-
     deploy:
       resources:
         limits:
-          cpus: "0.35"
-          memory: "30MB"
+          cpus: "0.3"
+          memory: "50MB"
 
 networks:
   backend:
     driver: bridge
   payment-processor:
-    external: true 
+    external: true

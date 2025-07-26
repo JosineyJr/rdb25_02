@@ -35,7 +35,9 @@ func NewRedisDB(redisURL, redisSocket, key string) (*RedisDB, error) {
 	client := redis.NewClient(opts)
 	ctx := context.Background()
 
-	r := &RedisDB{client: client}
+	r := &RedisDB{
+		client: client,
+	}
 	if err = r.createKeys(ctx); err != nil {
 		return nil, err
 	}

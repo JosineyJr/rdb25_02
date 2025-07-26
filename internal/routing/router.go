@@ -30,7 +30,6 @@ type AdaptiveRouter struct {
 	agg             *storage.RedisDB
 	client          *fasthttp.Client
 	PayloadChan     chan payments.PaymentsPayload
-	BytesChan       chan []byte
 	workers         int
 	cbState         atomic.Int32
 	cbFailures      atomic.Int32
@@ -46,7 +45,6 @@ func NewAdaptiveRouter(
 		client:      &fasthttp.Client{},
 		workers:     workers,
 		PayloadChan: make(chan payments.PaymentsPayload, 6500),
-		BytesChan:   make(chan []byte, 6500),
 		agg:         agg,
 	}
 }
@@ -70,12 +68,6 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case b := <-ar.BytesChan:
-					var payload payments.PaymentsPayload
-					if err := json.Unmarshal(b, &payload); err != nil {
-						continue
-					}
-					ar.PayloadChan <- payload
 				case p := <-ar.PayloadChan:
 					if ar.agg.PaymentIsProcessed(ctx, p.CorrelationID) {
 						continue
