@@ -21,8 +21,8 @@ const (
 )
 
 const (
-	failureThreshold = 15
-	openStateTimeout = 5 * time.Second
+	failureThreshold = 10
+	openStateTimeout = 2 * time.Second
 )
 
 type AdaptiveRouter struct {
@@ -110,7 +110,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 	fl := ar.fallbackLatency.Load()
 
 	if state == StateHalfOpen {
-		if dl > 80 {
+		if dl > 50 {
 			return nil, ""
 		}
 
@@ -118,14 +118,14 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 	}
 
 	if fl > 0 && dl > (3*fl) {
-		if fl > 20 {
-			return nil, ""
+		if fl > 30 {
+			return ar.sendToDefault, payments.DefaultProcessor
 		}
 
 		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
-	if dl > 80 {
+	if dl > 50 {
 		return nil, ""
 	}
 

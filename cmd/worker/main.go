@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
 	"github.com/JosineyJr/rdb25_02/internal/health"
@@ -13,14 +12,7 @@ import (
 	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
-)
-
-const (
-	streamName    = "payments_stream"
-	consumerGroup = "payments_processors"
-	consumerName  = "worker"
 )
 
 var json = jsoniter.ConfigFastest
@@ -44,12 +36,10 @@ func main() {
 		logger.Fatal().Err(err).Msg("Unable to connect to Redis")
 	}
 
-	redisOpts, err := redis.ParseURL(os.Getenv("REDIS_URL"))
+	pubsub, err := storage.NewRedisPubSub(os.Getenv("REDIS_URL"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to parse Redis URL")
+		logger.Fatal().Err(err).Msg("Unable to connect to Redis for pubsub")
 	}
-	redisClient := redis.NewClient(redisOpts)
-	_ = redisClient.XGroupCreateMkStream(ctx, streamName, consumerGroup, "0").Err()
 
 	ar := routing.NewAdaptiveRouter(
 		4,
@@ -62,46 +52,21 @@ func main() {
 
 	logger.Info().Msg("Worker starting...")
 
-	readTicker := time.NewTicker(time.Second)
+	ch := pubsub.Subscribe(ctx, "payments_channel")
+
 f:
 	for {
 		select {
 		case <-ctx.Done():
 			break f
-		case <-readTicker.C:
-			streams, err := redisClient.XReadGroup(ctx, &redis.XReadGroupArgs{
-				Group:    consumerGroup,
-				Consumer: consumerName,
-				Streams:  []string{streamName, ">"},
-				Count:    3000,
-			}).Result()
-
-			if err != nil {
-				if err != redis.Nil {
-					logger.Error().Err(err).Msg("Failed to get payment from stream")
-				}
+		case msg := <-ch:
+			var payload payments.PaymentsPayload
+			if err := json.UnmarshalFromString(msg.Payload, &payload); err != nil {
+				logger.Error().Err(err).Msg("Failed to unmarshal payment payload")
 				continue
 			}
 
-		s:
-			for _, stream := range streams {
-				for _, message := range stream.Messages {
-					payloadData, ok := message.Values["payload"].(string)
-					if !ok || payloadData == "" {
-						break s
-					}
-
-					var payload payments.PaymentsPayload
-					if err := json.UnmarshalFromString(payloadData, &payload); err != nil {
-						logger.Error().Err(err).Msg("Failed to unmarshal payment payload")
-						continue
-					}
-
-					ar.PayloadChan <- payload
-
-					redisClient.XAck(ctx, streamName, consumerGroup, message.ID)
-				}
-			}
+			ar.PayloadChan <- payload
 		}
 	}
 

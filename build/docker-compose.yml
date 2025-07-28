@@ -1,6 +1,8 @@
 x-service-templates:
   base: &base
-    image: josiney/rdb25_02-amd64:d1fefa11
+    build:
+      context: ../ 
+      dockerfile: ./build/Dockerfile
     networks:
       - backend
       - payment-processor

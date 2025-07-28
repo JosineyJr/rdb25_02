@@ -22,7 +22,6 @@ import (
 // HTTP Responses
 var (
 	http200Ok         = []byte("HTTP/1.1 200 Ok\r\nContent-Length: 0\r\n\r\n")
-	http202Accepted   = []byte("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
 	http204NoContent  = []byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
 	http404NotFound   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
 	http405NotAllowed = []byte("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
@@ -34,8 +33,9 @@ var json = jsoniter.ConfigFastest
 type paymentServer struct {
 	gnet.BuiltinEventEngine
 	db     *storage.RedisDB
-	stream *storage.RedisStream
+	pubsub *storage.RedisPubSub
 	logger *zerolog.Logger
+	ctx    context.Context
 }
 
 func main() {
@@ -55,21 +55,16 @@ func main() {
 		logger.Fatal().Err(err).Msg("Unable to connect to Redis for aggregator")
 	}
 
-	stream, err := storage.NewRedisStream(
-		redisURL,
-		redisSocket,
-		750,
-		500*time.Millisecond,
-	)
+	pubsub, err := storage.NewRedisPubSub(redisURL)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to connect to Redis for aggregator")
+		logger.Fatal().Err(err).Msg("Unable to connect to Redis for pubsub")
 	}
-	stream.StartBatchWorker(context.Background(), &logger)
 
 	ps := &paymentServer{
 		db:     db,
-		stream: stream,
+		pubsub: pubsub,
 		logger: &logger,
+		ctx:    context.Background(),
 	}
 
 	addr := fmt.Sprintf("tcp://:%s", config.PORT)
@@ -78,6 +73,7 @@ func main() {
 		gnet.WithMulticore(true),
 		gnet.WithReusePort(true),
 		gnet.WithTCPNoDelay(gnet.TCPNoDelay),
+		gnet.WithNumEventLoop(3),
 	)
 	if err != nil {
 		log.Fatalf("Gnet server failed to start: %v", err)
@@ -110,7 +106,16 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	switch string(path) {
 	case "/payments":
 		if method == "POST" {
-			ps.handleCreatePayment(c, buf)
+			c.Write(http200Ok)
+			idx := bytes.Index(buf, []byte("\r\n\r\n"))
+			if idx == -1 {
+				c.Close()
+				return
+			}
+			body := make([]byte, len(buf[idx+4:]))
+			copy(body, buf[idx+4:])
+			go ps.handleCreatePayment(body)
+			return
 		} else {
 			c.Write(http405NotAllowed)
 		}
@@ -132,18 +137,8 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	return
 }
 
-func (ps *paymentServer) handleCreatePayment(c gnet.Conn, buf []byte) {
-	idx := bytes.Index(buf, []byte("\r\n\r\n"))
-	if idx == -1 {
-		c.Close()
-		return
-	}
-
-	body := make([]byte, len(buf[idx+4:]))
-	copy(body, buf[idx+4:])
-
-	go ps.stream.Add(body)
-	c.Write(http200Ok)
+func (ps *paymentServer) handleCreatePayment(buf []byte) {
+	ps.pubsub.Publish(ps.ctx, "payments_channel", buf)
 }
 
 func (ps *paymentServer) handlePaymentsSummary(c gnet.Conn, query string) {
@@ -165,7 +160,7 @@ func (ps *paymentServer) handlePaymentsSummary(c gnet.Conn, query string) {
 		return
 	}
 
-	defaultData, fallbackData, err := ps.db.GetSummary(context.Background(), &from, &to)
+	defaultData, fallbackData, err := ps.db.GetSummary(ps.ctx, &from, &to)
 	if err != nil {
 		ps.logger.Error().Err(err).Msg("Failed to get summary from Redis")
 		c.Write(http500Error)
@@ -196,7 +191,7 @@ func (ps *paymentServer) handlePaymentsSummary(c gnet.Conn, query string) {
 }
 
 func (ps *paymentServer) handlePurgePayments(c gnet.Conn) {
-	err := ps.db.PurgeSummary(context.Background())
+	err := ps.db.PurgeSummary(ps.ctx)
 	if err != nil {
 		ps.logger.Error().Err(err).Msg("Failed to purge payments table")
 		c.Write(http500Error)
