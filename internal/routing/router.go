@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -27,7 +28,7 @@ const (
 
 type AdaptiveRouter struct {
 	cbLastOpenTime  time.Time
-	agg             *storage.RedisDB
+	agg             *storage.RingBufferAggregator
 	client          *fasthttp.Client
 	PayloadChan     chan payments.PaymentsPayload
 	workers         int
@@ -39,12 +40,12 @@ type AdaptiveRouter struct {
 
 func NewAdaptiveRouter(
 	workers int,
-	agg *storage.RedisDB,
+	agg *storage.RingBufferAggregator,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
 		client:      &fasthttp.Client{},
 		workers:     workers,
-		PayloadChan: make(chan payments.PaymentsPayload, 6500),
+		PayloadChan: make(chan payments.PaymentsPayload, 12500),
 		agg:         agg,
 	}
 }
@@ -69,9 +70,9 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case p := <-ar.PayloadChan:
-					if ar.agg.PaymentIsProcessed(ctx, p.CorrelationID) {
-						continue
-					}
+					// if ar.agg.PaymentIsProcessed(ctx, p.CorrelationID) {
+					// 	continue
+					// }
 
 					targetFunc, processorName := ar.chooseProcessor()
 					if targetFunc == nil {
@@ -88,7 +89,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 						continue
 					}
 
-					ar.agg.MarkAsProcessed(ctx, p.CorrelationID)
+					// ar.agg.MarkAsProcessed(ctx, p.CorrelationID)
 				}
 			}
 		}()
@@ -218,6 +219,10 @@ func (ar *AdaptiveRouter) sendRequest(
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
 		ar.agg.Update(ctx, processorName, payload)
+		return true
+	}
+
+	if resp.StatusCode() == http.StatusUnprocessableEntity {
 		return true
 	}
 

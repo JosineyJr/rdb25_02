@@ -5,15 +5,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
-	"net/url"
+	"net"
 	"os"
-	"strconv"
-	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
-	"github.com/JosineyJr/rdb25_02/internal/storage"
-	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
@@ -32,10 +27,9 @@ var json = jsoniter.ConfigFastest
 
 type paymentServer struct {
 	gnet.BuiltinEventEngine
-	db     *storage.RedisDB
-	pubsub *storage.RedisPubSub
-	logger *zerolog.Logger
-	ctx    context.Context
+	logger  *zerolog.Logger
+	ctx     context.Context
+	udpConn *net.UDPConn
 }
 
 func main() {
@@ -43,28 +37,20 @@ func main() {
 
 	logger := zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 
-	redisURL := os.Getenv("REDIS_URL")
-	redisSocket := os.Getenv("REDIS_SOCKET")
-
-	db, err := storage.NewRedisDB(
-		redisURL,
-		redisSocket,
-		"payments-summary",
-	)
+	workerAddr, err := net.ResolveUDPAddr("udp", "worker1:9996")
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to connect to Redis for aggregator")
+		log.Fatalf("Failed to resolve worker address: %v", err)
 	}
 
-	pubsub, err := storage.NewRedisPubSub(redisURL)
+	conn, err := net.DialUDP("udp", nil, workerAddr)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to connect to Redis for pubsub")
+		log.Fatalf("Failed to dial worker via UDP: %v", err)
 	}
 
 	ps := &paymentServer{
-		db:     db,
-		pubsub: pubsub,
-		logger: &logger,
-		ctx:    context.Background(),
+		logger:  &logger,
+		ctx:     context.Background(),
+		udpConn: conn,
 	}
 
 	addr := fmt.Sprintf("tcp://:%s", config.PORT)
@@ -85,6 +71,12 @@ func (ps *paymentServer) OnBoot(eng gnet.Engine) (action gnet.Action) {
 	return
 }
 
+func (ps *paymentServer) OnShutdown(eng gnet.Engine) {
+	if ps.udpConn != nil {
+		ps.udpConn.Close()
+	}
+}
+
 func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	buf, err := c.Next(-1)
 	if err != nil {
@@ -99,38 +91,20 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	if len(requestLineParts) != 3 {
 		return gnet.Close
 	}
-	method := string(requestLineParts[0])
-	fullPath := string(requestLineParts[1])
-	path, query, _ := bytes.Cut([]byte(fullPath), []byte("?"))
+	path, _, _ := bytes.Cut(requestLineParts[1], []byte("?"))
 
 	switch string(path) {
 	case "/payments":
-		if method == "POST" {
-			c.Write(http200Ok)
-			idx := bytes.Index(buf, []byte("\r\n\r\n"))
-			if idx == -1 {
-				c.Close()
-				return
-			}
-			body := make([]byte, len(buf[idx+4:]))
-			copy(body, buf[idx+4:])
-			go ps.handleCreatePayment(body)
+		c.Write(http200Ok)
+		idx := bytes.Index(buf, []byte("\r\n\r\n"))
+		if idx == -1 {
+			c.Close()
 			return
-		} else {
-			c.Write(http405NotAllowed)
 		}
-	case "/payments-summary":
-		if method == "GET" {
-			ps.handlePaymentsSummary(c, string(query))
-		} else {
-			c.Write(http405NotAllowed)
-		}
-	case "/purge-payments":
-		if method == "POST" {
-			ps.handlePurgePayments(c)
-		} else {
-			c.Write(http405NotAllowed)
-		}
+		body := make([]byte, len(buf[idx+4:]))
+		copy(body, buf[idx+4:])
+		go ps.handleCreatePayment(body)
+		return
 	default:
 		c.Write(http404NotFound)
 	}
@@ -138,78 +112,8 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 }
 
 func (ps *paymentServer) handleCreatePayment(buf []byte) {
-	ps.pubsub.Publish(ps.ctx, "payments_channel", buf)
-}
-
-func (ps *paymentServer) handlePaymentsSummary(c gnet.Conn, query string) {
-	q, err := url.ParseQuery(query)
+	_, err := ps.udpConn.Write(buf)
 	if err != nil {
-		c.Write(http500Error)
-		return
+		ps.logger.Error().Err(err).Msg("Failed to send payment data to worker via UDP")
 	}
-
-	from, err := parseDate(q.Get("from"), ps.logger)
-	if err != nil {
-		c.Write(http500Error)
-		return
-	}
-
-	to, err := parseDate(q.Get("to"), ps.logger)
-	if err != nil {
-		c.Write(http500Error)
-		return
-	}
-
-	defaultData, fallbackData, err := ps.db.GetSummary(ps.ctx, &from, &to)
-	if err != nil {
-		ps.logger.Error().Err(err).Msg("Failed to get summary from Redis")
-		c.Write(http500Error)
-		return
-	}
-
-	defaultData.Total = math.Round(defaultData.Total*10) / 10
-	fallbackData.Total = math.Round(fallbackData.Total*10) / 10
-
-	respBody, err := json.Marshal(payments.PaymentsSummary{
-		Default:  defaultData,
-		Fallback: fallbackData,
-	})
-	if err != nil {
-		ps.logger.Error().Err(err).Msg("Failed to marshal summary response")
-		c.Write(http500Error)
-		return
-	}
-
-	var response bytes.Buffer
-	response.WriteString("HTTP/1.1 200 OK\r\n")
-	response.WriteString("Content-Type: application/json\r\n")
-	response.WriteString("Content-Length: " + strconv.Itoa(len(respBody)) + "\r\n")
-	response.WriteString("\r\n")
-	response.Write(respBody)
-
-	c.Write(response.Bytes())
-}
-
-func (ps *paymentServer) handlePurgePayments(c gnet.Conn) {
-	err := ps.db.PurgeSummary(ps.ctx)
-	if err != nil {
-		ps.logger.Error().Err(err).Msg("Failed to purge payments table")
-		c.Write(http500Error)
-		return
-	}
-	c.Write(http204NoContent)
-}
-
-func parseDate(date string, logger *zerolog.Logger) (time.Time, error) {
-	if date == "" {
-		return time.Now(), nil
-	}
-
-	if t, err := time.Parse(time.RFC3339Nano, date); err == nil {
-		return t, nil
-	}
-	if t, err := time.Parse(time.RFC3339, date); err == nil {
-		return t, nil
-	}
-	return time.Time{}, fmt.Errorf("invalid date format: %s", date)
 }

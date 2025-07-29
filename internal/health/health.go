@@ -29,8 +29,6 @@ func NewHealthUpdater(router *routing.AdaptiveRouter) *HealthUpdater {
 }
 
 func (hu *HealthUpdater) Start(ctx context.Context) {
-	hu.updateMetrics()
-
 	go func() {
 		for {
 			select {
