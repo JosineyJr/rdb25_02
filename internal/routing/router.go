@@ -103,7 +103,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 		if time.Since(ar.cbLastOpenTime) > openStateTimeout {
 			ar.cbState.Store(StateHalfOpen)
 		} else {
-			return ar.sendToFallback, payments.FallbackProcessor
+			return nil, ""
 		}
 	}
 
@@ -111,24 +111,24 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 	fl := ar.fallbackLatency.Load()
 
 	if state == StateHalfOpen {
-		if dl > 50 {
-			return nil, ""
-		}
+		// if dl > 30 {
+		// 	return nil, ""
+		// }
 
 		return ar.sendToDefault, payments.DefaultProcessor
 	}
 
 	if fl > 0 && dl > (3*fl) {
-		if fl > 30 {
+		if fl > 20 {
 			return ar.sendToDefault, payments.DefaultProcessor
 		}
 
 		return ar.sendToFallback, payments.FallbackProcessor
 	}
 
-	if dl > 50 {
-		return nil, ""
-	}
+	// if dl > 30 {
+	// 	return nil, ""
+	// }
 
 	return ar.sendToDefault, payments.DefaultProcessor
 }
