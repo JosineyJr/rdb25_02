@@ -70,9 +70,10 @@ func main() {
 		err := gnet.Run(
 			httpServer,
 			"tcp://:9995",
+			gnet.WithReusePort(true),
 			gnet.WithMulticore(true),
 			gnet.WithTCPNoDelay(gnet.TCPNoDelay),
-			gnet.WithNumEventLoop(3),
+			gnet.WithLockOSThread(true),
 		)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("gnet HTTP server failed to start")

@@ -59,7 +59,7 @@ func main() {
 		gnet.WithMulticore(true),
 		gnet.WithReusePort(true),
 		gnet.WithTCPNoDelay(gnet.TCPNoDelay),
-		gnet.WithNumEventLoop(3),
+		gnet.WithLockOSThread(true),
 	)
 	if err != nil {
 		log.Fatalf("Gnet server failed to start: %v", err)
