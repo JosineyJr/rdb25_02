@@ -7,6 +7,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
 	jsoniter "github.com/json-iterator/go"
@@ -21,45 +24,60 @@ var (
 	http404NotFound   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
 	http405NotAllowed = []byte("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
 	http500Error      = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+	bufferPool        = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
 )
 
 var json = jsoniter.ConfigFastest
 
 type paymentServer struct {
 	gnet.BuiltinEventEngine
-	logger  *zerolog.Logger
-	ctx     context.Context
-	udpConn *net.UDPConn
+	logger     *zerolog.Logger
+	ctx        context.Context
+	workerPath string
+	socketPath string
 }
 
 func main() {
+	runtime.GOMAXPROCS(4)
 	config.LoadEnv()
 
 	logger := zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 
-	workerAddr, err := net.ResolveUDPAddr("udp", "worker1:9996")
-	if err != nil {
-		log.Fatalf("Failed to resolve worker address: %v", err)
-	}
-
-	conn, err := net.DialUDP("udp", nil, workerAddr)
-	if err != nil {
-		log.Fatalf("Failed to dial worker via UDP: %v", err)
-	}
-
 	ps := &paymentServer{
-		logger:  &logger,
-		ctx:     context.Background(),
-		udpConn: conn,
+		logger:     &logger,
+		ctx:        context.Background(),
+		workerPath: os.Getenv("WORKER_SOCKET_PATH"),
+		socketPath: os.Getenv("SOCKET_PATH"),
 	}
 
-	addr := fmt.Sprintf("tcp://:%s", config.PORT)
+	socketPath := os.Getenv("SOCKET_PATH")
+	if socketPath == "" {
+		log.Fatal("SOCKET_PATH environment variable not set")
+	}
+
+	socketDir := filepath.Dir(socketPath)
+	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(socketDir, 0777); err != nil {
+			log.Fatalf("Failed to create socket dir %s: %v", socketDir, err)
+		}
+	}
+
+	if _, err := os.Stat(socketPath); err == nil {
+		os.Remove(socketPath)
+	}
+
+	addr := fmt.Sprintf("unix://%s", socketPath)
+
 	log.Printf("Gnet server starting on %s", addr)
-	err = gnet.Run(ps, addr,
+	err := gnet.Run(ps, addr,
 		gnet.WithMulticore(true),
-		gnet.WithReusePort(true),
-		gnet.WithTCPNoDelay(gnet.TCPNoDelay),
 		gnet.WithLockOSThread(true),
+		gnet.WithNumEventLoop(4),
 	)
 	if err != nil {
 		log.Fatalf("Gnet server failed to start: %v", err)
@@ -72,9 +90,7 @@ func (ps *paymentServer) OnBoot(eng gnet.Engine) (action gnet.Action) {
 }
 
 func (ps *paymentServer) OnShutdown(eng gnet.Engine) {
-	if ps.udpConn != nil {
-		ps.udpConn.Close()
-	}
+
 }
 
 func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
@@ -96,15 +112,44 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	switch string(path) {
 	case "/payments":
 		c.Write(http200Ok)
-		idx := bytes.Index(buf, []byte("\r\n\r\n"))
-		if idx == -1 {
-			c.Close()
+		go ps.handleCreatePayment(buf)
+		return
+	case "/payments-summary":
+		conn, err := net.Dial("unix", ps.workerPath)
+		if err != nil {
+			ps.logger.Error().Err(err).Msg("Failed to connect to worker via Unix socket")
 			return
 		}
-		body := make([]byte, len(buf[idx+4:]))
-		copy(body, buf[idx+4:])
-		go ps.handleCreatePayment(body)
-		return
+		defer conn.Close()
+
+		_, err = conn.Write(buf)
+		if err != nil {
+			ps.logger.Error().Err(err).Msg("Failed to send payment data to worker")
+		}
+
+		bufPtr := bufferPool.Get().(*[]byte)
+		defer bufferPool.Put(bufPtr)
+
+		n, _ := conn.Read(*bufPtr)
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, (*bufPtr)[:n])
+			c.Write(data)
+		}
+
+	case "/purge-payments":
+		conn, err := net.Dial("unix", ps.workerPath)
+		if err != nil {
+			ps.logger.Error().Err(err).Msg("Failed to connect to worker via Unix socket")
+			return
+		}
+		defer conn.Close()
+
+		_, err = conn.Write(buf)
+		if err != nil {
+			ps.logger.Error().Err(err).Msg("Failed to send payment data to worker")
+		}
+		c.Write(http204NoContent)
 	default:
 		c.Write(http404NotFound)
 	}
@@ -112,8 +157,15 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 }
 
 func (ps *paymentServer) handleCreatePayment(buf []byte) {
-	_, err := ps.udpConn.Write(buf)
+	conn, err := net.Dial("unix", ps.workerPath)
 	if err != nil {
-		ps.logger.Error().Err(err).Msg("Failed to send payment data to worker via UDP")
+		ps.logger.Error().Err(err).Msg("Failed to connect to worker via Unix socket")
+		return
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(buf)
+	if err != nil {
+		ps.logger.Error().Err(err).Msg("Failed to send payment data to worker")
 	}
 }

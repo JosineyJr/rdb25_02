@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
+	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ type HTTPServer struct {
 	gnet.BuiltinEventEngine
 	aggregator *storage.RingBufferAggregator
 	logger     *zerolog.Logger
+	ar         *routing.AdaptiveRouter
 }
 
 var (
@@ -59,17 +61,35 @@ func main() {
 	healthUpdater := health.NewHealthUpdater(ar)
 	healthUpdater.Start(ctx)
 
-	go runUDPListener(ctx, ar, &logger)
-
 	httpServer := &HTTPServer{
 		aggregator: summaryAggregator,
 		logger:     &logger,
+		ar:         ar,
 	}
+
+	socketPath := os.Getenv("SOCKET_PATH")
+	if socketPath == "" {
+		log.Fatal("SOCKET_PATH environment variable not set")
+	}
+
+	socketDir := filepath.Dir(socketPath)
+	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(socketDir, 0777); err != nil {
+			log.Fatalf("Failed to create socket dir %s: %v", socketDir, err)
+		}
+	}
+
+	if _, err := os.Stat(socketPath); err == nil {
+		os.Remove(socketPath)
+	}
+
+	httpAddr := fmt.Sprintf("unix://%s", socketPath)
+
 	go func() {
-		logger.Info().Msg("Worker starting gnet HTTP server on port 9995...")
+		logger.Info().Msgf("Worker starting gnet HTTP server on %s", httpAddr)
 		err := gnet.Run(
 			httpServer,
-			"tcp://:9995",
+			httpAddr,
 			gnet.WithReusePort(true),
 			gnet.WithMulticore(true),
 			gnet.WithTCPNoDelay(gnet.TCPNoDelay),
@@ -82,44 +102,6 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info().Msg("Worker stopped gracefully")
-}
-
-func runUDPListener(ctx context.Context, ar *routing.AdaptiveRouter, logger *zerolog.Logger) {
-	logger.Info().Msg("Worker starting UDP listener on port 9996...")
-	addr, err := net.ResolveUDPAddr("udp", ":9996")
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to resolve UDP address")
-	}
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("Failed to start UDP listener")
-	}
-	defer conn.Close()
-
-	buf := make([]byte, 2048)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				logger.Error().Err(err).Msg("Failed to read from UDP connection")
-				continue
-			}
-
-			var payload payments.PaymentsPayload
-			if err := json.Unmarshal(buf[:n], &payload); err != nil {
-				logger.Error().Err(err).Msg("Failed to unmarshal payment payload from UDP")
-				continue
-			}
-			ar.PayloadChan <- payload
-		}
-	}
 }
 
 func (s *HTTPServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
@@ -142,6 +124,21 @@ func (s *HTTPServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	path, query, _ := bytes.Cut([]byte(fullPath), []byte("?"))
 
 	switch string(path) {
+	case "/payments":
+		c.Write(http200OK)
+		idx := bytes.Index(buf, []byte("\r\n\r\n"))
+		if idx == -1 {
+			c.Close()
+			return
+		}
+		body := make([]byte, len(buf[idx+4:]))
+		copy(body, buf[idx+4:])
+		var payload payments.PaymentsPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			s.logger.Error().Err(err).Msg("Failed to unmarshal payment payload from UDP")
+			return
+		}
+		s.ar.PayloadChan <- payload
 	case "/payments-summary":
 		q, _ := bytes.CutPrefix(query, []byte("from="))
 		fromStr, toStr, _ := bytes.Cut(q, []byte("&to="))

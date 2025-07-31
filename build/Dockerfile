@@ -13,9 +13,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOGC=off GOMEMLIMIT=20MiB go build -ldflags="-w -s"
 
 FROM alpine:latest
 
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-USER appuser
-
 WORKDIR /app
 
 COPY --from=builder /app/tmp/api .
