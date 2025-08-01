@@ -22,6 +22,9 @@ services:
     environment:
       - SOCKET_PATH=/sockets/api1.sock
       - WORKER_SOCKET_PATH=/sockets/worker_http.sock
+      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
+      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
+      - PURGE_SOCKET_PATH=/sockets/purge.sock
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
@@ -42,6 +45,55 @@ services:
     environment:
       - SOCKET_PATH=/sockets/api2.sock
       - WORKER_SOCKET_PATH=/sockets/worker_http.sock
+      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
+      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
+      - PURGE_SOCKET_PATH=/sockets/purge.sock
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
+    command: ./api
+    depends_on:
+      - worker1
+
+  api3:
+    <<: *base
+    container_name: api3
+    hostname: api3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "30MB"
+    environment:
+      - SOCKET_PATH=/sockets/api3.sock
+      - WORKER_SOCKET_PATH=/sockets/worker_http.sock
+      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
+      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
+      - PURGE_SOCKET_PATH=/sockets/purge.sock
+      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
+      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
+      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
+      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
+    command: ./api
+    depends_on:
+      - worker1
+
+  api4:
+    <<: *base
+    container_name: api4
+    hostname: api4
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: "30MB"
+    environment:
+      - SOCKET_PATH=/sockets/api4.sock
+      - WORKER_SOCKET_PATH=/sockets/worker_http.sock
+      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
+      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
+      - PURGE_SOCKET_PATH=/sockets/purge.sock
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
@@ -61,6 +113,9 @@ services:
           memory: "150MB"
     environment:
       - SOCKET_PATH=/sockets/worker_http.sock
+      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
+      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
+      - PURGE_SOCKET_PATH=/sockets/purge.sock
       - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
       - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
@@ -68,6 +123,7 @@ services:
     command: ./worker
 
   lb:
+    user: root
     image: haproxy:latest
     container_name: haproxy_lb
     volumes:
@@ -79,6 +135,7 @@ services:
       - worker1
     ports:
       - 9999:80
+      - 8404:8404
     networks:
       - backend
     deploy:
@@ -87,8 +144,33 @@ services:
           cpus: "0.3"
           memory: "30MB"
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - backend
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - backend
+    depends_on:
+      - prometheus
+
 volumes:
   sockets:
+  grafana-data:
 
 networks:
   backend:

@@ -3,19 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
-	"github.com/JosineyJr/rdb25_02/internal/health"
-	"github.com/JosineyJr/rdb25_02/internal/routing"
 	"github.com/JosineyJr/rdb25_02/internal/storage"
-	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
@@ -27,7 +26,6 @@ type HTTPServer struct {
 	gnet.BuiltinEventEngine
 	aggregator *storage.RingBufferAggregator
 	logger     *zerolog.Logger
-	ar         *routing.AdaptiveRouter
 }
 
 var (
@@ -42,6 +40,7 @@ func init() {
 }
 
 func main() {
+	runtime.GOMAXPROCS(4)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -50,21 +49,6 @@ func main() {
 	summaryAggregator, err := storage.NewInMemoryAggregator()
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
-	}
-
-	ar := routing.NewAdaptiveRouter(
-		2,
-		summaryAggregator,
-	)
-	ar.Start(ctx)
-
-	healthUpdater := health.NewHealthUpdater(ar)
-	healthUpdater.Start(ctx)
-
-	httpServer := &HTTPServer{
-		aggregator: summaryAggregator,
-		logger:     &logger,
-		ar:         ar,
 	}
 
 	socketPath := os.Getenv("SOCKET_PATH")
@@ -83,89 +67,135 @@ func main() {
 		os.Remove(socketPath)
 	}
 
-	httpAddr := fmt.Sprintf("unix://%s", socketPath)
+	if _, err := os.Stat(os.Getenv("PAYMENTS_SOCKET_PATH")); err == nil {
+		os.Remove(os.Getenv("PAYMENTS_SOCKET_PATH"))
+	}
+
+	if _, err := os.Stat(os.Getenv("SUMMARY_SOCKET_PATH")); err == nil {
+		os.Remove(os.Getenv("SUMMARY_SOCKET_PATH"))
+	}
+
+	if _, err := os.Stat(os.Getenv("PURGE_SOCKET_PATH")); err == nil {
+		os.Remove(os.Getenv("PURGE_SOCKET_PATH"))
+	}
+
+	paymentsListener, err := net.Listen("unix", os.Getenv("PAYMENTS_SOCKET_PATH"))
+	if err != nil {
+		log.Fatalf("Failed to listen on socket: %v", err)
+	}
+	defer func() {
+		paymentsListener.Close()
+		os.RemoveAll(os.Getenv("PAYMENTS_SOCKET_PATH"))
+	}()
+
+	summaryListener, err := net.Listen("unix", os.Getenv("SUMMARY_SOCKET_PATH"))
+	if err != nil {
+		log.Fatalf("Failed to listen on socket: %v", err)
+	}
+	defer func() {
+		summaryListener.Close()
+		os.RemoveAll(os.Getenv("SUMMARY_SOCKET_PATH"))
+	}()
+
+	purgeListener, err := net.Listen("unix", os.Getenv("PURGE_SOCKET_PATH"))
+	if err != nil {
+		log.Fatalf("Failed to listen on socket: %v", err)
+	}
+	defer func() {
+		purgeListener.Close()
+		os.RemoveAll(os.Getenv("PURGE_SOCKET_PATH"))
+	}()
 
 	go func() {
-		logger.Info().Msgf("Worker starting gnet HTTP server on %s", httpAddr)
-		err := gnet.Run(
-			httpServer,
-			httpAddr,
-			gnet.WithReusePort(true),
-			gnet.WithMulticore(true),
-			gnet.WithTCPNoDelay(gnet.TCPNoDelay),
-			gnet.WithLockOSThread(true),
-		)
-		if err != nil {
-			logger.Fatal().Err(err).Msg("gnet HTTP server failed to start")
+		for {
+			conn, err := paymentsListener.Accept()
+			if err != nil {
+				log.Printf("Failed to accept connection: %v", err)
+				return
+			}
+
+			go func() {
+				for {
+					buf := make([]byte, 27)
+					_, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					n := bytes.IndexByte(buf, 0)
+					if n == -1 {
+						n = len(buf)
+					}
+					buf = buf[:n]
+					s := bytes.IndexByte(buf, '|')
+					if s == -1 {
+						s = len(buf)
+					}
+					ts, _ := strconv.Atoi(string(buf[s+1:]))
+					summaryAggregator.Update(ctx, string(buf[:s]), int64(ts))
+				}
+			}()
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := summaryListener.Accept()
+			if err != nil {
+				log.Printf("Failed to accept connection: %v", err)
+				return
+			}
+
+			go func() {
+				for {
+					buf := make([]byte, 57)
+					_, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					n := bytes.IndexByte(buf, 0)
+					if n == -1 {
+						n = len(buf)
+					}
+
+					q, _ := bytes.CutPrefix(buf[:n], []byte("from="))
+					fromStr, toStr, _ := bytes.Cut(q, []byte("&to="))
+					from, _ := time.Parse(time.RFC3339Nano, string(fromStr))
+					to, err := time.Parse(time.RFC3339Nano, string(toStr))
+					if err != nil {
+						from, to = time.Now(), time.Now()
+					}
+
+					summary, err := summaryAggregator.GetSummary(ctx, &from, &to)
+					if err != nil {
+						return
+					}
+					jsoniter.ConfigFastest.NewEncoder(conn).Encode(summary)
+				}
+			}()
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := purgeListener.Accept()
+			if err != nil {
+				log.Printf("Failed to accept connection: %v", err)
+				return
+			}
+
+			go func() {
+				for {
+					buf := make([]byte, 1)
+					_, err := conn.Read(buf)
+					if err != nil {
+						return
+					}
+					summaryAggregator.PurgeSummary(ctx)
+				}
+			}()
 		}
 	}()
 
 	<-ctx.Done()
 	logger.Info().Msg("Worker stopped gracefully")
-}
-
-func (s *HTTPServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
-	buf, err := c.Next(-1)
-	if err != nil {
-		return gnet.Close
-	}
-
-	requestLineEnd := bytes.Index(buf, []byte("\r\n"))
-	if requestLineEnd == -1 {
-		return gnet.Close
-	}
-
-	requestLineParts := bytes.Split(buf[:requestLineEnd], []byte(" "))
-	if len(requestLineParts) < 2 {
-		return gnet.Close
-	}
-
-	fullPath := string(requestLineParts[1])
-	path, query, _ := bytes.Cut([]byte(fullPath), []byte("?"))
-
-	switch string(path) {
-	case "/payments":
-		c.Write(http200OK)
-		idx := bytes.Index(buf, []byte("\r\n\r\n"))
-		if idx == -1 {
-			c.Close()
-			return
-		}
-		body := make([]byte, len(buf[idx+4:]))
-		copy(body, buf[idx+4:])
-		var payload payments.PaymentsPayload
-		if err := json.Unmarshal(body, &payload); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to unmarshal payment payload from UDP")
-			return
-		}
-		s.ar.PayloadChan <- payload
-	case "/payments-summary":
-		q, _ := bytes.CutPrefix(query, []byte("from="))
-		fromStr, toStr, _ := bytes.Cut(q, []byte("&to="))
-		from, _ := time.Parse(time.RFC3339Nano, string(fromStr))
-		to, err := time.Parse(time.RFC3339Nano, string(toStr))
-		if err != nil {
-			from, to = time.Now(), time.Now()
-		}
-
-		defaultData, fallbackData, _ := s.aggregator.GetSummary(context.Background(), &from, &to)
-		summary := payments.PaymentsSummary{Default: defaultData, Fallback: fallbackData}
-		respBody, _ := json.Marshal(summary)
-
-		response := fmt.Sprintf(
-			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
-			len(respBody),
-			respBody,
-		)
-		c.Write([]byte(response))
-
-	case "/purge-payments":
-		s.aggregator.PurgeSummary(context.Background())
-		c.Write(http204NoContent)
-
-	default:
-		c.Write(http404NotFound)
-	}
-
-	return gnet.None
 }

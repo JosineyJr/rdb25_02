@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'haproxy'
+    static_configs:
+      - targets: ['haproxy_lb:8404']

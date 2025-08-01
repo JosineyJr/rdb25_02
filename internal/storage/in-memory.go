@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -35,11 +36,11 @@ func NewInMemoryAggregator() (*RingBufferAggregator, error) {
 func (a *RingBufferAggregator) Update(
 	ctx context.Context,
 	processor string,
-	payload *payments.PaymentsPayload,
+	requestedAt int64,
 ) {
 	dp := DataPoint{
-		Timestamp: payload.RequestedAt.UnixNano(),
-		Amount:    payload.Amount,
+		Timestamp: requestedAt,
+		Amount:    19.9,
 	}
 
 	if processor == payments.DefaultProcessor {
@@ -47,6 +48,7 @@ func (a *RingBufferAggregator) Update(
 		index := (cursor - 1) & (RingBufferSize - 1)
 		a.defaultData[index] = dp
 	} else {
+		fmt.Println(processor)
 		cursor := a.fallbackWriteCursor.Add(1)
 		index := (cursor - 1) & (RingBufferSize - 1)
 		a.fallbackData[index] = dp
@@ -55,7 +57,7 @@ func (a *RingBufferAggregator) Update(
 
 func (a *RingBufferAggregator) GetSummary(
 	ctx context.Context, from, to *time.Time,
-) (payments.SummaryData, payments.SummaryData, error) {
+) (payments.PaymentsSummary, error) {
 	var defaultSummary, fallbackSummary payments.SummaryData
 	fromNano, toNano := from.UnixNano(), to.UnixNano()
 
@@ -91,7 +93,10 @@ func (a *RingBufferAggregator) GetSummary(
 		}
 	}
 
-	return defaultSummary, fallbackSummary, nil
+	return payments.PaymentsSummary{
+		Default:  defaultSummary,
+		Fallback: fallbackSummary,
+	}, nil
 }
 
 func (a *RingBufferAggregator) PurgeSummary(ctx context.Context) error {

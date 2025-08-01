@@ -7,11 +7,15 @@ import (
 	"log"
 	"net"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
+	"github.com/JosineyJr/rdb25_02/internal/health"
+	"github.com/JosineyJr/rdb25_02/internal/routing"
+	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
@@ -36,46 +40,93 @@ var json = jsoniter.ConfigFastest
 
 type paymentServer struct {
 	gnet.BuiltinEventEngine
-	logger     *zerolog.Logger
-	ctx        context.Context
-	workerPath string
-	socketPath string
+	logger       *zerolog.Logger
+	ctx          context.Context
+	socketPath   string
+	paymentsConn *net.UnixConn
+	summaryConn  *net.UnixConn
+	purgeConn    *net.UnixConn
+	ar           *routing.AdaptiveRouter
 }
 
 func main() {
 	runtime.GOMAXPROCS(4)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	config.LoadEnv()
 
 	logger := zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 
+	paymentsAddr, err := net.ResolveUnixAddr("unix", os.Getenv("PAYMENTS_SOCKET_PATH"))
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+	}
+	paymentsConn, err := net.DialUnix("unix", nil, paymentsAddr)
+	if err != nil {
+		log.Fatalf("Failed to dial socket: %v", err)
+	}
+	defer paymentsConn.Close()
+
+	summaryAddr, err := net.ResolveUnixAddr("unix", os.Getenv("SUMMARY_SOCKET_PATH"))
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+	}
+	summaryConn, err := net.DialUnix("unix", nil, summaryAddr)
+	if err != nil {
+		log.Fatalf("Failed to dial socket: %v", err)
+	}
+	defer summaryConn.Close()
+
+	purgeAddr, err := net.ResolveUnixAddr("unix", os.Getenv("PURGE_SOCKET_PATH"))
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+	}
+	purgeConn, err := net.DialUnix("unix", nil, purgeAddr)
+	if err != nil {
+		log.Fatalf("Failed to dial socket: %v", err)
+	}
+	defer summaryConn.Close()
+
+	ar := routing.NewAdaptiveRouter(
+		2,
+		paymentsConn,
+	)
+	ar.Start(ctx)
+
+	healthUpdater := health.NewHealthUpdater(ar)
+	healthUpdater.Start(ctx)
+
 	ps := &paymentServer{
-		logger:     &logger,
-		ctx:        context.Background(),
-		workerPath: os.Getenv("WORKER_SOCKET_PATH"),
-		socketPath: os.Getenv("SOCKET_PATH"),
+		logger:       &logger,
+		ctx:          context.Background(),
+		socketPath:   os.Getenv("SOCKET_PATH"),
+		paymentsConn: paymentsConn,
+		summaryConn:  summaryConn,
+		purgeConn:    purgeConn,
+		ar:           ar,
 	}
 
-	socketPath := os.Getenv("SOCKET_PATH")
-	if socketPath == "" {
-		log.Fatal("SOCKET_PATH environment variable not set")
-	}
+	// socketPath := os.Getenv("SOCKET_PATH")
+	// if socketPath == "" {
+	// 	log.Fatal("SOCKET_PATH environment variable not set")
+	// }
 
-	socketDir := filepath.Dir(socketPath)
-	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(socketDir, 0777); err != nil {
-			log.Fatalf("Failed to create socket dir %s: %v", socketDir, err)
-		}
-	}
+	// socketDir := filepath.Dir(socketPath)
+	// if _, err := os.Stat(socketDir); os.IsNotExist(err) {
+	// 	if err := os.MkdirAll(socketDir, 0777); err != nil {
+	// 		log.Fatalf("Failed to create socket dir %s: %v", socketDir, err)
+	// 	}
+	// }
 
-	if _, err := os.Stat(socketPath); err == nil {
-		os.Remove(socketPath)
-	}
+	// if _, err := os.Stat(socketPath); err == nil {
+	// 	os.Remove(socketPath)
+	// }
 
-	addr := fmt.Sprintf("unix://%s", socketPath)
-
+	addr := fmt.Sprintf("unix://%s", ps.socketPath)
 	log.Printf("Gnet server starting on %s", addr)
-	err := gnet.Run(ps, addr,
+	err = gnet.Run(ps, addr,
 		gnet.WithMulticore(true),
+		gnet.WithReusePort(true),
 		gnet.WithLockOSThread(true),
 		gnet.WithNumEventLoop(4),
 	)
@@ -107,65 +158,47 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	if len(requestLineParts) != 3 {
 		return gnet.Close
 	}
-	path, _, _ := bytes.Cut(requestLineParts[1], []byte("?"))
+	path, query, _ := bytes.Cut(requestLineParts[1], []byte("?"))
 
 	switch string(path) {
 	case "/payments":
 		c.Write(http200Ok)
-		go ps.handleCreatePayment(buf)
+		idx := bytes.Index(buf, []byte("\r\n\r\n"))
+		if idx == -1 {
+			c.Close()
+			return
+		}
+		var payload payments.PaymentsPayload
+		if err := json.Unmarshal(buf[idx+4:], &payload); err != nil {
+			ps.logger.Error().Err(err).Msg("Failed to unmarshal payment payload from UDP")
+			return
+		}
+		ps.ar.PayloadChan <- payload
 		return
 	case "/payments-summary":
-		conn, err := net.Dial("unix", ps.workerPath)
+		_, err := ps.summaryConn.Write(query)
 		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to connect to worker via Unix socket")
+			ps.logger.Error().Err(err).Msg("Failed to get summaty")
 			return
 		}
-		defer conn.Close()
-
-		_, err = conn.Write(buf)
-		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to send payment data to worker")
+		s := make([]byte, 256)
+		ps.summaryConn.Read(s)
+		n := bytes.IndexByte(s, 0)
+		if n == -1 {
+			n = len(s)
 		}
-
-		bufPtr := bufferPool.Get().(*[]byte)
-		defer bufferPool.Put(bufPtr)
-
-		n, _ := conn.Read(*bufPtr)
-		if n > 0 {
-			data := make([]byte, n)
-			copy(data, (*bufPtr)[:n])
-			c.Write(data)
-		}
-
+		s = s[:n]
+		response := fmt.Sprintf(
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+			len(s),
+			s,
+		)
+		c.Write([]byte(response))
 	case "/purge-payments":
-		conn, err := net.Dial("unix", ps.workerPath)
-		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to connect to worker via Unix socket")
-			return
-		}
-		defer conn.Close()
-
-		_, err = conn.Write(buf)
-		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to send payment data to worker")
-		}
 		c.Write(http204NoContent)
+		ps.purgeConn.Write([]byte("1"))
 	default:
 		c.Write(http404NotFound)
 	}
 	return
-}
-
-func (ps *paymentServer) handleCreatePayment(buf []byte) {
-	conn, err := net.Dial("unix", ps.workerPath)
-	if err != nil {
-		ps.logger.Error().Err(err).Msg("Failed to connect to worker via Unix socket")
-		return
-	}
-	defer conn.Close()
-
-	_, err = conn.Write(buf)
-	if err != nil {
-		ps.logger.Error().Err(err).Msg("Failed to send payment data to worker")
-	}
 }

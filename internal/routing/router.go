@@ -2,12 +2,13 @@ package routing
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
-	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/valyala/fasthttp"
@@ -28,7 +29,7 @@ const (
 
 type AdaptiveRouter struct {
 	cbLastOpenTime  time.Time
-	agg             *storage.RingBufferAggregator
+	paymentsConn    *net.UnixConn
 	client          *fasthttp.Client
 	PayloadChan     chan payments.PaymentsPayload
 	workers         int
@@ -40,13 +41,13 @@ type AdaptiveRouter struct {
 
 func NewAdaptiveRouter(
 	workers int,
-	agg *storage.RingBufferAggregator,
+	paymentsConn *net.UnixConn,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
-		client:      &fasthttp.Client{},
-		workers:     workers,
-		PayloadChan: make(chan payments.PaymentsPayload, 12500),
-		agg:         agg,
+		client:       &fasthttp.Client{},
+		workers:      workers,
+		PayloadChan:  make(chan payments.PaymentsPayload, 12500),
+		paymentsConn: paymentsConn,
 	}
 }
 
@@ -205,7 +206,6 @@ func (ar *AdaptiveRouter) sendRequest(
 	req.Header.SetMethod(fasthttp.MethodPost)
 	req.Header.SetContentType("application/json")
 
-	payload.RequestedAt = time.Now().UTC()
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return false
@@ -218,7 +218,9 @@ func (ar *AdaptiveRouter) sendRequest(
 	}
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
-		ar.agg.Update(ctx, processorName, payload)
+		ar.paymentsConn.Write(
+			[]byte(processorName + "|" + strconv.Itoa(int(time.Now().UTC().UnixNano()))),
+		)
 		return true
 	}
 
