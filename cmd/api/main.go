@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -88,7 +89,7 @@ func main() {
 	defer summaryConn.Close()
 
 	ar := routing.NewAdaptiveRouter(
-		2,
+		3,
 		paymentsConn,
 	)
 	ar.Start(ctx)
@@ -176,18 +177,22 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		ps.ar.PayloadChan <- payload
 		return
 	case "/payments-summary":
-		_, err := ps.summaryConn.Write(query)
+		_, err := ps.summaryConn.Write(append(query, '\n'))
 		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to get summaty")
+			ps.logger.Error().Err(err).Msg("Failed to write to summary socket")
+			c.Write(http500Error)
 			return
 		}
-		s := make([]byte, 256)
-		ps.summaryConn.Read(s)
-		n := bytes.IndexByte(s, 0)
-		if n == -1 {
-			n = len(s)
+
+		reader := bufio.NewReader(ps.summaryConn)
+		s, err := reader.ReadBytes('\n')
+		if err != nil {
+			ps.logger.Error().Err(err).Msg("Failed to read from summary socket")
+			c.Write(http500Error)
+			return
 		}
-		s = s[:n]
+		s = bytes.TrimSpace(s)
+
 		response := fmt.Sprintf(
 			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
 			len(s),

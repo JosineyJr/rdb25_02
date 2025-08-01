@@ -219,7 +219,7 @@ func (ar *AdaptiveRouter) sendRequest(
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
 		ar.paymentsConn.Write(
-			[]byte(processorName + "|" + strconv.Itoa(int(time.Now().UTC().UnixNano()))),
+			[]byte(processorName + "|" + strconv.Itoa(int(time.Now().UTC().UnixNano())) + "\n"),
 		)
 		return true
 	}
