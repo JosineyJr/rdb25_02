@@ -23,7 +23,7 @@ const (
 )
 
 const (
-	failureThreshold = 10
+	failureThreshold = 2
 	openStateTimeout = 2 * time.Second
 )
 
@@ -31,7 +31,7 @@ type AdaptiveRouter struct {
 	cbLastOpenTime  time.Time
 	paymentsConn    *net.UnixConn
 	client          *fasthttp.Client
-	PayloadChan     chan payments.PaymentsPayload
+	PayloadChan     chan string
 	workers         int
 	cbState         atomic.Int32
 	cbFailures      atomic.Int32
@@ -46,7 +46,7 @@ func NewAdaptiveRouter(
 	return &AdaptiveRouter{
 		client:       &fasthttp.Client{},
 		workers:      workers,
-		PayloadChan:  make(chan payments.PaymentsPayload, 12500),
+		PayloadChan:  make(chan string, 5500),
 		paymentsConn: paymentsConn,
 	}
 }
@@ -97,7 +97,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 	}
 }
 
-func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payments.PaymentsPayload) bool, processorName string) {
+func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *string) bool, processorName string) {
 	state := ar.cbState.Load()
 
 	if state == StateOpen {
@@ -120,7 +120,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *payme
 	}
 
 	if fl > 0 && dl > (3*fl) {
-		if fl > 20 {
+		if fl > 10 {
 			return ar.sendToDefault, payments.DefaultProcessor
 		}
 
@@ -169,32 +169,32 @@ func (ar *AdaptiveRouter) openCircuit() {
 
 func (ar *AdaptiveRouter) sendToDefault(
 	ctx context.Context,
-	payload *payments.PaymentsPayload,
+	correlationId *string,
 ) bool {
 	return ar.sendRequest(
 		ctx,
 		config.PAYMENTS_PROCESSOR_URL_DEFAULT,
 		payments.DefaultProcessor,
-		payload,
+		correlationId,
 	)
 }
 
 func (ar *AdaptiveRouter) sendToFallback(
 	ctx context.Context,
-	payload *payments.PaymentsPayload,
+	correlationId *string,
 ) bool {
 	return ar.sendRequest(
 		ctx,
 		config.PAYMENTS_PROCESSOR_URL_FALLBACK,
 		payments.FallbackProcessor,
-		payload,
+		correlationId,
 	)
 }
 
 func (ar *AdaptiveRouter) sendRequest(
 	ctx context.Context,
 	url, processorName string,
-	payload *payments.PaymentsPayload,
+	correlationId *string,
 ) bool {
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
@@ -206,6 +206,11 @@ func (ar *AdaptiveRouter) sendRequest(
 	req.Header.SetMethod(fasthttp.MethodPost)
 	req.Header.SetContentType("application/json")
 
+	payload := payments.PaymentsPayload{
+		CorrelationID: correlationId,
+		RequestedAt:   time.Now().UTC(),
+		Amount:        19.9,
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return false
@@ -219,7 +224,7 @@ func (ar *AdaptiveRouter) sendRequest(
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
 		ar.paymentsConn.Write(
-			[]byte(processorName + "|" + strconv.Itoa(int(time.Now().UTC().UnixNano())) + "\n"),
+			[]byte(processorName + "|" + strconv.Itoa(int(payload.RequestedAt.UnixNano())) + "\n"),
 		)
 		return true
 	}

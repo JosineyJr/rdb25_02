@@ -9,14 +9,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime"
+	"regexp"
 	"sync"
 	"syscall"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
-	"github.com/JosineyJr/rdb25_02/internal/health"
 	"github.com/JosineyJr/rdb25_02/internal/routing"
-	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
@@ -48,10 +46,10 @@ type paymentServer struct {
 	summaryConn  *net.UnixConn
 	purgeConn    *net.UnixConn
 	ar           *routing.AdaptiveRouter
+	re           *regexp.Regexp
 }
 
 func main() {
-	runtime.GOMAXPROCS(4)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	config.LoadEnv()
@@ -89,13 +87,13 @@ func main() {
 	defer summaryConn.Close()
 
 	ar := routing.NewAdaptiveRouter(
-		3,
+		1,
 		paymentsConn,
 	)
 	ar.Start(ctx)
 
-	healthUpdater := health.NewHealthUpdater(ar)
-	healthUpdater.Start(ctx)
+	// healthUpdater := health.NewHealthUpdater(ar)
+	// healthUpdater.Start(ctx)
 
 	ps := &paymentServer{
 		logger:       &logger,
@@ -105,6 +103,7 @@ func main() {
 		summaryConn:  summaryConn,
 		purgeConn:    purgeConn,
 		ar:           ar,
+		re:           regexp.MustCompile(`"correlationId"\s*:\s*"([^"]+)"`),
 	}
 
 	// socketPath := os.Getenv("SOCKET_PATH")
@@ -128,8 +127,6 @@ func main() {
 	err = gnet.Run(ps, addr,
 		gnet.WithMulticore(true),
 		gnet.WithReusePort(true),
-		gnet.WithLockOSThread(true),
-		gnet.WithNumEventLoop(4),
 	)
 	if err != nil {
 		log.Fatalf("Gnet server failed to start: %v", err)
@@ -153,28 +150,31 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 	requestLineEnd := bytes.Index(buf, []byte("\r\n"))
 	if requestLineEnd == -1 {
-		return gnet.Close
+		fmt.Println("Requisição inválida")
+		return
 	}
-	requestLineParts := bytes.Split(buf[:requestLineEnd], []byte(" "))
-	if len(requestLineParts) != 3 {
-		return gnet.Close
+	requestLine := buf[:requestLineEnd]
+
+	pathStart := bytes.IndexByte(requestLine, ' ')
+	if pathStart == -1 {
+		fmt.Println("Espaçamento inválido")
+		return
 	}
-	path, query, _ := bytes.Cut(requestLineParts[1], []byte("?"))
+	pathStart++
+
+	pathEnd := bytes.LastIndexByte(requestLine, ' ')
+	if pathEnd == -1 || pathEnd <= pathStart {
+		fmt.Println("Formato de requisição inválido")
+		return
+	}
+
+	path, query, _ := bytes.Cut(requestLine[pathStart:pathEnd], []byte("?"))
 
 	switch string(path) {
 	case "/payments":
 		c.Write(http200Ok)
-		idx := bytes.Index(buf, []byte("\r\n\r\n"))
-		if idx == -1 {
-			c.Close()
-			return
-		}
-		var payload payments.PaymentsPayload
-		if err := json.Unmarshal(buf[idx+4:], &payload); err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to unmarshal payment payload from UDP")
-			return
-		}
-		ps.ar.PayloadChan <- payload
+		matches := ps.re.FindSubmatch(buf)
+		ps.ar.PayloadChan <- string(matches[1])
 		return
 	case "/payments-summary":
 		_, err := ps.summaryConn.Write(append(query, '\n'))

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -28,13 +27,12 @@ func init() {
 }
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	logger := zerolog.New(os.Stdout).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 
-	summaryAggregator, err := storage.NewAtomicRingBufferAggregator()
+	summaryAggregator, err := storage.NewInMemoryAggregator()
 	if err != nil {
 		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
 	}
