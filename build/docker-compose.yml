@@ -10,16 +10,18 @@ x-service-templates:
       - payment-processor
 
 services:
-  api1:
+  lb:
     <<: *base
-    container_name: api1
-    hostname: api1
+    container_name: lb
+    hostname: lb
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.25"
           memory: "30MB"
     environment:
+      - LB=1
+      - PORT=:80
       - SOCKET_PATH=/sockets/api1.sock
       - WORKER_SOCKET_PATH=/sockets/worker_http.sock
       - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
@@ -30,66 +32,22 @@ services:
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
     command: ./api
+    ports:
+      - 9999:80
     depends_on:
-      - worker1
+      - api1
 
-  api2:
+  api1:
     <<: *base
-    container_name: api2
-    hostname: api2
+    container_name: api1
+    hostname: api1
     deploy:
       resources:
         limits:
-          cpus: "0.1"
+          cpus: "0.25"
           memory: "30MB"
     environment:
       - SOCKET_PATH=/sockets/api2.sock
-      - WORKER_SOCKET_PATH=/sockets/worker_http.sock
-      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
-      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
-      - PURGE_SOCKET_PATH=/sockets/purge.sock
-      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
-      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
-      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
-      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    command: ./api
-    depends_on:
-      - worker1
-
-  api3:
-    <<: *base
-    container_name: api3
-    hostname: api3
-    deploy:
-      resources:
-        limits:
-          cpus: "0.1"
-          memory: "30MB"
-    environment:
-      - SOCKET_PATH=/sockets/api3.sock
-      - WORKER_SOCKET_PATH=/sockets/worker_http.sock
-      - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
-      - SUMMARY_SOCKET_PATH=/sockets/summary.sock
-      - PURGE_SOCKET_PATH=/sockets/purge.sock
-      - PAYMENTS_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments
-      - PAYMENTS_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments
-      - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
-      - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
-    command: ./api
-    depends_on:
-      - worker1
-
-  api4:
-    <<: *base
-    container_name: api4
-    hostname: api4
-    deploy:
-      resources:
-        limits:
-          cpus: "0.1"
-          memory: "30MB"
-    environment:
-      - SOCKET_PATH=/sockets/api4.sock
       - WORKER_SOCKET_PATH=/sockets/worker_http.sock
       - PAYMENTS_SOCKET_PATH=/sockets/payments.sock
       - SUMMARY_SOCKET_PATH=/sockets/summary.sock
@@ -121,29 +79,6 @@ services:
       - HEALTH_PROCESSOR_URL_DEFAULT=http://payment-processor-default:8080/payments/service-health
       - HEALTH_PROCESSOR_URL_FALLBACK=http://payment-processor-fallback:8080/payments/service-health
     command: ./worker
-
-  lb:
-    user: root
-    image: haproxy:latest
-    container_name: haproxy_lb
-    volumes:
-      - sockets:/sockets
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    depends_on:
-      - api1
-      - api2
-      - api3
-      - api4
-    ports:
-      - 9999:80
-      - 8404:8404
-    networks:
-      - backend
-    deploy:
-      resources:
-        limits:
-          cpus: "0.1"
-          memory: "30MB"
 
 volumes:
   sockets:
