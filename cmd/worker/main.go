@@ -105,9 +105,17 @@ func main() {
 	defer purgeListener.Close()
 
 	go handleConnections(ctx, purgeListener, &logger, func(conn net.Conn) {
-		buf := make([]byte, 1)
-		conn.Read(buf)
-		summaryAggregator.PurgeSummary(ctx)
+		reader := bufio.NewReader(conn)
+		for {
+			_, err := reader.ReadBytes('\n')
+			if err != nil {
+				if err != io.EOF {
+					logger.Error().Err(err).Msg("Error reading from summary socket")
+				}
+				return
+			}
+			summaryAggregator.PurgeSummary(ctx)
+		}
 	})
 
 	logger.Info().Msg("Worker started successfully, listening on sockets.")

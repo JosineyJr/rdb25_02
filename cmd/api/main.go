@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -29,6 +31,84 @@ var (
 	http500Error     = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
 )
 
+// UnixConnPool gerencia um pool de conexões de soquete Unix.
+type UnixConnPool struct {
+	mu      sync.Mutex
+	conns   chan *net.UnixConn
+	factory func() (*net.UnixConn, error)
+}
+
+// NewUnixConnPool cria um novo pool de conexões.
+func NewUnixConnPool(
+	initialSize, maxSize int,
+	factory func() (*net.UnixConn, error),
+) (*UnixConnPool, error) {
+	if initialSize < 0 || maxSize <= 0 || initialSize > maxSize {
+		return nil, errors.New("invalid capacity settings")
+	}
+
+	pool := &UnixConnPool{
+		conns:   make(chan *net.UnixConn, maxSize),
+		factory: factory,
+	}
+
+	for range initialSize {
+		conn, err := factory()
+		if err != nil {
+			close(pool.conns)
+			for c := range pool.conns {
+				c.Close()
+			}
+			return nil, err
+		}
+		pool.conns <- conn
+	}
+
+	return pool, nil
+}
+
+// Get retira uma conexão do pool ou cria uma nova se o pool estiver vazio.
+func (p *UnixConnPool) Get() (*net.UnixConn, error) {
+	select {
+	case conn := <-p.conns:
+		if conn == nil {
+			return nil, errors.New("connection is nil from pool")
+		}
+		return conn, nil
+	default:
+		return p.factory()
+	}
+}
+
+// Put devolve uma conexão ao pool. Se a conexão for nil ou o pool estiver cheio, a conexão é fechada.
+func (p *UnixConnPool) Put(conn *net.UnixConn) {
+	if conn == nil {
+		return
+	}
+
+	select {
+	case p.conns <- conn:
+	default:
+		conn.Close()
+	}
+}
+
+// Close fecha todas as conexões no pool.
+func (p *UnixConnPool) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conns == nil {
+		return
+	}
+
+	close(p.conns)
+	for conn := range p.conns {
+		conn.Close()
+	}
+	p.conns = nil
+}
+
 type paymentServer struct {
 	gnet.BuiltinEventEngine
 	logger           *zerolog.Logger
@@ -39,7 +119,7 @@ type paymentServer struct {
 	purgeConn        *net.UnixConn
 	ar               *routing.AdaptiveRouter
 	re               *regexp.Regexp
-	paymentBackends  []*net.UnixConn
+	backendPool      *UnixConnPool // Alterado para usar o pool
 	nextBackendIndex atomic.Uint64
 	processPayment   func(c gnet.Conn, buf []byte)
 }
@@ -79,7 +159,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to dial socket: %v", err)
 	}
-	defer summaryConn.Close()
+	defer purgeConn.Close()
 
 	ar := routing.NewAdaptiveRouter(
 		2,
@@ -119,35 +199,63 @@ func main() {
 
 	var addr string
 	if os.Getenv("LB") == "1" {
-		ps.paymentBackends = make([]*net.UnixConn, 0, 2)
-		for i := 2; i <= 2; i++ {
-			socketPath := fmt.Sprintf("/tmp/api%d.sock", i)
-			addr, err := net.ResolveUnixAddr("unix", socketPath)
+		backendSockets := []string{"/sockets/api2.sock", "/sockets/api3.sock"}
+		var currentSocket uint64
+
+		// Factory para criar novas conexões para o pool
+		factory := func() (*net.UnixConn, error) {
+			sockPath := backendSockets[atomic.AddUint64(&currentSocket, 1)%uint64(len(backendSockets))]
+			addr, err := net.ResolveUnixAddr("unix", sockPath)
 			if err != nil {
-				logger.Fatal().Err(err).Msgf("Failed to resolve unix addr for %s", socketPath)
+				return nil, fmt.Errorf("failed to resolve unix addr for %s: %w", sockPath, err)
 			}
-			conn, err := net.DialUnix("unix", nil, addr)
-			if err != nil {
-				logger.Fatal().Err(err).Msgf("Failed to dial socket %s", socketPath)
-			}
-			defer conn.Close()
-			ps.paymentBackends = append(ps.paymentBackends, conn)
-			logger.Info().Msgf("Connected to payment backend: %s", socketPath)
+			return net.DialUnix("unix", nil, addr)
 		}
+
+		// Cria um pool com 5 conexões iniciais por backend e um máximo de 50 no total
+		pool, err := NewUnixConnPool(len(backendSockets)*5, 50, factory)
+		if err != nil {
+			logger.Fatal().Err(err).Msg("Failed to create connection pool")
+		}
+		ps.backendPool = pool
+
+		totalProcessingNodes := uint64(len(backendSockets) + 1)
+
 		ps.processPayment = func(c gnet.Conn, buf []byte) {
 			c.Write(http200Ok)
-			idx := (ps.nextBackendIndex.Add(1) - 1) % uint64(len(ps.paymentBackends)+1)
+			nodeIndex := (ps.nextBackendIndex.Add(1) - 1) % totalProcessingNodes
+
 			matches := ps.re.FindSubmatch(buf)
-			if idx == 0 {
+			if len(matches) < 2 {
+				return
+			}
+
+			// Nó 0: LB processa localmente
+			if nodeIndex == 0 {
+				ps.logger.Info().Msg("LB is processing the request locally")
 				ps.ar.PayloadChan <- string(matches[1])
 				return
 			}
 
-			_, err := ps.paymentBackends[idx-1].Write(buf)
+			// Outros nós: encaminha para um backend usando o pool
+			logger.Info().Msgf("Forwarding request to a backend worker")
+
+			conn, err := ps.backendPool.Get()
 			if err != nil {
-				ps.logger.Error().
-					Err(err).
-					Msg("Failed to write to payment backend")
+				ps.logger.Error().Err(err).Msg("Failed to get connection from pool")
+				// Se não conseguirmos uma conexão, podemos tentar processar localmente como fallback
+				ps.ar.PayloadChan <- string(matches[1])
+				return
+			}
+
+			_, err = conn.Write(buf)
+			if err != nil {
+				ps.logger.Error().Err(err).Msg("Failed to write to payment backend")
+				// A conexão está ruim, feche-a e não a devolva ao pool
+				conn.Close()
+			} else {
+				// Devolve a conexão ao pool se a escrita foi bem-sucedida
+				ps.backendPool.Put(conn)
 			}
 		}
 		addr = "tcp4://" + config.PORT
@@ -160,7 +268,7 @@ func main() {
 		addr = fmt.Sprintf("unix://%s", ps.socketPath)
 	}
 
-	log.Printf("Gnet server starting on %s", addr)
+	logger.Info().Msgf("Gnet server starting on %s", addr)
 	err = gnet.Run(ps, addr,
 		gnet.WithMulticore(true),
 		gnet.WithReusePort(true),
@@ -176,7 +284,9 @@ func (ps *paymentServer) OnBoot(eng gnet.Engine) (action gnet.Action) {
 }
 
 func (ps *paymentServer) OnShutdown(eng gnet.Engine) {
-
+	if ps.backendPool != nil {
+		ps.backendPool.Close()
+	}
 }
 
 func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
@@ -235,7 +345,7 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		c.Write([]byte(response))
 	case "/purge-payments":
 		c.Write(http204NoContent)
-		ps.purgeConn.Write([]byte("1"))
+		ps.purgeConn.Write([]byte("1\n"))
 	default:
 		c.Write(http404NotFound)
 	}

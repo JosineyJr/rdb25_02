@@ -77,6 +77,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 
 					targetFunc, processorName := ar.chooseProcessor()
 					if targetFunc == nil {
+						time.Sleep(100 * time.Millisecond)
 						ar.PayloadChan <- p
 						continue
 					}
@@ -86,6 +87,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 					ar.updateCircuitState(processorName, success)
 
 					if !success {
+						time.Sleep(100 * time.Millisecond)
 						ar.PayloadChan <- p
 						continue
 					}
