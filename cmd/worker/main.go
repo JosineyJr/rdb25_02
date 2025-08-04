@@ -16,6 +16,7 @@ import (
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
 	"github.com/JosineyJr/rdb25_02/internal/storage"
+	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/rs/zerolog"
 )
@@ -88,11 +89,20 @@ func main() {
 			from, _ := time.Parse(time.RFC3339Nano, string(fromStr))
 			to, _ := time.Parse(time.RFC3339Nano, string(toStr))
 
-			summary, err := summaryAggregator.GetSummary(ctx, &from, &to)
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to get summary")
-				continue
-			}
+			defaultData, fallbackData, _ := summaryAggregator.GetSummary(ctx, &from, &to)
+			summary := payments.PaymentsSummary{Default: defaultData, Fallback: fallbackData}
+			// respBody, _ := json.Marshal(summary)
+
+			// response := fmt.Sprintf(
+			// 	"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+			// 	len(respBody),
+			// 	respBody,
+			// )
+			// summary, err := summaryAggregator.GetSummary(ctx, &from, &to)
+			// if err != nil {
+			// 	logger.Error().Err(err).Msg("Failed to get summary")
+			// 	continue
+			// }
 
 			json.NewEncoder(conn).Encode(summary)
 		}

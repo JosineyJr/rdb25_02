@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -9,7 +10,7 @@ import (
 )
 
 const (
-	RingBufferSize = 18000 // 2^20
+	RingBufferSize = 1048576 // 2^20
 )
 
 type DataPoint struct {
@@ -55,46 +56,56 @@ func (a *RingBufferAggregator) Update(
 
 func (a *RingBufferAggregator) GetSummary(
 	ctx context.Context, from, to *time.Time,
-) (payments.PaymentsSummary, error) {
+) (payments.SummaryData, payments.SummaryData, error) {
 	var defaultSummary, fallbackSummary payments.SummaryData
 	fromNano, toNano := from.UnixNano(), to.UnixNano()
 
-	defaultCursor := a.defaultWriteCursor.Load()
-	defaultCount := min(defaultCursor, RingBufferSize)
+	wg := sync.WaitGroup{}
+	wg.Add(2)
 
-	for i := range defaultCount {
-		index := (defaultCursor - 1 - i) & (RingBufferSize - 1)
-		dp := &a.defaultData[index]
+	go func() {
+		defer wg.Done()
 
-		if dp.Timestamp == 0 {
-			continue
+		defaultCursor := a.defaultWriteCursor.Load()
+		defaultCount := min(defaultCursor, RingBufferSize)
+
+		for i := range defaultCount {
+			index := (defaultCursor - 1 - i) & (RingBufferSize - 1)
+			dp := &a.defaultData[index]
+
+			if dp.Timestamp == 0 {
+				continue
+			}
+			if dp.Timestamp >= fromNano && dp.Timestamp <= toNano {
+				defaultSummary.Count++
+				defaultSummary.Total += dp.Amount
+			}
 		}
-		if dp.Timestamp >= fromNano && dp.Timestamp <= toNano {
-			defaultSummary.Count++
-			defaultSummary.Total += dp.Amount
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		fallbackCursor := a.fallbackWriteCursor.Load()
+		fallbackCount := min(fallbackCursor, RingBufferSize)
+
+		for i := range fallbackCount {
+			index := (fallbackCursor - 1 - i) & (RingBufferSize - 1)
+			dp := &a.fallbackData[index]
+
+			if dp.Timestamp == 0 {
+				continue
+			}
+			if dp.Timestamp >= fromNano && dp.Timestamp <= toNano {
+				fallbackSummary.Count++
+				fallbackSummary.Total += dp.Amount
+			}
 		}
-	}
+	}()
 
-	fallbackCursor := a.fallbackWriteCursor.Load()
-	fallbackCount := min(fallbackCursor, RingBufferSize)
+	wg.Wait()
 
-	for i := range fallbackCount {
-		index := (fallbackCursor - 1 - i) & (RingBufferSize - 1)
-		dp := &a.fallbackData[index]
-
-		if dp.Timestamp == 0 {
-			continue
-		}
-		if dp.Timestamp >= fromNano && dp.Timestamp <= toNano {
-			fallbackSummary.Count++
-			fallbackSummary.Total += dp.Amount
-		}
-	}
-
-	return payments.PaymentsSummary{
-		Default:  defaultSummary,
-		Fallback: fallbackSummary,
-	}, nil
+	return defaultSummary, fallbackSummary, nil
 }
 
 func (a *RingBufferAggregator) PurgeSummary(ctx context.Context) error {
