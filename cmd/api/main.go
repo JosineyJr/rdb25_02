@@ -272,6 +272,7 @@ func main() {
 	err = gnet.Run(ps, addr,
 		gnet.WithMulticore(true),
 		gnet.WithReusePort(true),
+		gnet.WithLockOSThread(true),
 	)
 	if err != nil {
 		log.Fatalf("Gnet server failed to start: %v", err)

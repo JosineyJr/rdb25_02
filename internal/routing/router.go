@@ -122,7 +122,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *strin
 	}
 
 	if fl > 0 && dl > (3*fl) {
-		if fl > 20 {
+		if fl >= 15 {
 			return ar.sendToDefault, payments.DefaultProcessor
 		}
 
