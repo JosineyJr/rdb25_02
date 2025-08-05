@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
+	"github.com/JosineyJr/rdb25_02/internal/health"
 	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
@@ -35,20 +35,60 @@ func main() {
 
 	summaryAggregator, err := storage.NewInMemoryAggregator()
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 
 	setupSocketPath(os.Getenv("PAYMENTS_SOCKET_PATH"), &logger)
 	setupSocketPath(os.Getenv("SUMMARY_SOCKET_PATH"), &logger)
 	setupSocketPath(os.Getenv("PURGE_SOCKET_PATH"), &logger)
+	setupSocketPath(os.Getenv("HEALTH_SOCKET_PATH"), &logger)
+
+	healthBroadcaster := health.NewHealthBroadcaster()
+	healthUpdates := make(chan health.HealthReport, 1)
+	healthUpdater := health.NewHealthUpdater(healthUpdates)
+	healthUpdater.Start(ctx)
+
+	healthListener, err := net.Listen("unix", os.Getenv("HEALTH_SOCKET_PATH"))
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to listen on health socket")
+	}
+	defer healthListener.Close()
+
+	go func() {
+		for {
+			conn, err := healthListener.Accept()
+			if err != nil {
+				logger.Error().Err(err).Msg("failed to accept health subscriber")
+				return
+			}
+			healthBroadcaster.Add(conn)
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case report := <-healthUpdates:
+				jsonData, err := json.Marshal(report)
+				if err != nil {
+					logger.Error().Err(err).Msg("failed to marshal health report")
+					continue
+				}
+				healthBroadcaster.Broadcast(append(jsonData, '\n'))
+			}
+		}
+	}()
 
 	paymentsListener, err := net.Listen("unix", os.Getenv("PAYMENTS_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msgf("Failed to listen on payments socket")
+		logger.Fatal().Err(err).Msgf("failed to listen on payments socket")
 	}
 	defer paymentsListener.Close()
-
-	go handleConnections(ctx, paymentsListener, &logger, func(conn net.Conn) {
+	paymentsJobs := make(chan net.Conn, 512)
+	go acceptConnections(ctx, paymentsListener, paymentsJobs, &logger)
+	startWorkerPool(ctx, config.NUM_PAYMENT_WORKERS, paymentsJobs, func(conn net.Conn) {
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			buf := scanner.Bytes()
@@ -68,20 +108,15 @@ func main() {
 
 	summaryListener, err := net.Listen("unix", os.Getenv("SUMMARY_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msgf("Failed to listen on summary socket")
+		logger.Fatal().Err(err).Msgf("failed to listen on summary socket")
 	}
 	defer summaryListener.Close()
-
-	go handleConnections(ctx, summaryListener, &logger, func(conn net.Conn) {
-		reader := bufio.NewReader(conn)
-		for {
-			buf, err := reader.ReadBytes('\n')
-			if err != nil {
-				if err != io.EOF {
-					logger.Error().Err(err).Msg("Error reading from summary socket")
-				}
-				return
-			}
+	summaryJobs := make(chan net.Conn, 4)
+	go acceptConnections(ctx, summaryListener, summaryJobs, &logger)
+	startWorkerPool(ctx, config.NUM_WORKERS, summaryJobs, func(conn net.Conn) {
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			buf := scanner.Bytes()
 			buf = bytes.TrimSpace(buf)
 
 			q, _ := bytes.CutPrefix(buf, []byte("from="))
@@ -91,18 +126,6 @@ func main() {
 
 			defaultData, fallbackData, _ := summaryAggregator.GetSummary(ctx, &from, &to)
 			summary := payments.PaymentsSummary{Default: defaultData, Fallback: fallbackData}
-			// respBody, _ := json.Marshal(summary)
-
-			// response := fmt.Sprintf(
-			// 	"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
-			// 	len(respBody),
-			// 	respBody,
-			// )
-			// summary, err := summaryAggregator.GetSummary(ctx, &from, &to)
-			// if err != nil {
-			// 	logger.Error().Err(err).Msg("Failed to get summary")
-			// 	continue
-			// }
 
 			json.NewEncoder(conn).Encode(summary)
 		}
@@ -110,51 +133,57 @@ func main() {
 
 	purgeListener, err := net.Listen("unix", os.Getenv("PURGE_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msgf("Failed to listen on purge socket")
+		logger.Fatal().Err(err).Msgf("failed to listen on purge socket")
 	}
 	defer purgeListener.Close()
-
-	go handleConnections(ctx, purgeListener, &logger, func(conn net.Conn) {
-		reader := bufio.NewReader(conn)
-		for {
-			_, err := reader.ReadBytes('\n')
-			if err != nil {
-				if err != io.EOF {
-					logger.Error().Err(err).Msg("Error reading from summary socket")
-				}
-				return
-			}
+	purgeJobs := make(chan net.Conn, 4)
+	go acceptConnections(ctx, purgeListener, purgeJobs, &logger)
+	startWorkerPool(ctx, config.NUM_WORKERS, purgeJobs, func(conn net.Conn) {
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
 			summaryAggregator.PurgeSummary(ctx)
+
+			conn.Write([]byte("OK\n"))
 		}
 	})
 
-	logger.Info().Msg("Worker started successfully, listening on sockets.")
+	logger.Info().Msg("worker started successfully, listening on sockets.")
 	<-ctx.Done()
-	logger.Info().Msg("Worker stopped gracefully.")
+	logger.Info().Msg("worker stopped gracefully.")
 }
 
-func setupSocketPath(path string, logger *zerolog.Logger) {
-	if path == "" {
-		logger.Fatal().Msgf("Socket path environment variable not set for %s", path)
-	}
-	socketDir := filepath.Dir(path)
-	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(socketDir, 0755); err != nil {
-			log.Fatalf("Failed to create socket dir %s: %v", socketDir, err)
-		}
-	}
-	if _, err := os.Stat(path); err == nil {
-		if err := os.Remove(path); err != nil {
-			logger.Fatal().Err(err).Msgf("Failed to remove old socket file at %s", path)
-		}
+func startWorkerPool(
+	ctx context.Context,
+	numWorkers int,
+	jobs <-chan net.Conn,
+	handler func(net.Conn),
+) {
+	for range numWorkers {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case conn, ok := <-jobs:
+					if !ok {
+						return
+					}
+
+					func() {
+						defer conn.Close()
+						handler(conn)
+					}()
+				}
+			}
+		}()
 	}
 }
 
-func handleConnections(
+func acceptConnections(
 	ctx context.Context,
 	listener net.Listener,
+	jobs chan<- net.Conn,
 	logger *zerolog.Logger,
-	handler func(net.Conn),
 ) {
 	for {
 		select {
@@ -163,17 +192,27 @@ func handleConnections(
 		default:
 			conn, err := listener.Accept()
 			if err != nil {
-				if opErr, ok := err.(*net.OpError); ok &&
-					opErr.Err.Error() == "use of closed network connection" {
-					return
-				}
-				logger.Error().Err(err).Msg("Failed to accept new connection")
+				logger.Error().Err(err).Msg("failed to accept new connection")
 				continue
 			}
-			go func() {
-				defer conn.Close()
-				handler(conn)
-			}()
+			jobs <- conn
+		}
+	}
+}
+
+func setupSocketPath(path string, logger *zerolog.Logger) {
+	if path == "" {
+		logger.Fatal().Msgf("socket path environment variable not set for %s", path)
+	}
+	socketDir := filepath.Dir(path)
+	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(socketDir, 0755); err != nil {
+			log.Fatalf("failed to create socket dir %s: %v", socketDir, err)
+		}
+	}
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Remove(path); err != nil {
+			logger.Fatal().Err(err).Msgf("failed to remove old socket file at %s", path)
 		}
 	}
 }

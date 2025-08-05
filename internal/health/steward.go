@@ -8,23 +8,25 @@ import (
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
-	"github.com/JosineyJr/rdb25_02/internal/routing"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 )
 
-type HealthUpdater struct {
-	router *routing.AdaptiveRouter
-	client *http.Client
-	ticker *time.Ticker
-	done   chan bool
+type HealthReport struct {
+	Default  payments.ServiceHealthPayload `json:"default"`
+	Fallback payments.ServiceHealthPayload `json:"fallback"`
 }
 
-func NewHealthUpdater(router *routing.AdaptiveRouter) *HealthUpdater {
+type HealthUpdater struct {
+	client  *http.Client
+	ticker  *time.Ticker
+	updates chan<- HealthReport
+}
+
+func NewHealthUpdater(updates chan<- HealthReport) *HealthUpdater {
 	return &HealthUpdater{
-		router: router,
-		client: &http.Client{},
-		ticker: time.NewTicker(5 * time.Second),
-		done:   make(chan bool),
+		client:  &http.Client{},
+		ticker:  time.NewTicker(5 * time.Second),
+		updates: updates,
 	}
 }
 
@@ -61,15 +63,10 @@ func (hu *HealthUpdater) updateMetrics() {
 
 	wg.Wait()
 
-	defaultLatencySeconds := defaultState.MinResponseTime
-	fallbackLatencySeconds := fallbackState.MinResponseTime
-
-	hu.router.UpdateHealthMetrics(
-		defaultLatencySeconds,
-		fallbackLatencySeconds,
-		defaultState.Failing,
-	)
-	hu.ticker.Reset(5 * time.Second)
+	hu.updates <- HealthReport{
+		Default:  defaultState,
+		Fallback: fallbackState,
+	}
 }
 
 func (hu *HealthUpdater) getHealthStatus(healthURL string) payments.ServiceHealthPayload {

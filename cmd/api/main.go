@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,13 +11,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
 	"github.com/JosineyJr/rdb25_02/internal/health"
 	"github.com/JosineyJr/rdb25_02/internal/routing"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
 )
@@ -28,80 +28,8 @@ var (
 	http204NoContent = []byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
 	http404NotFound  = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
 	http500Error     = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+	json             = jsoniter.ConfigFastest
 )
-
-type UnixConnPool struct {
-	mu      sync.Mutex
-	conns   chan *net.UnixConn
-	factory func() (*net.UnixConn, error)
-}
-
-func NewUnixConnPool(
-	initialSize, maxSize int,
-	factory func() (*net.UnixConn, error),
-) (*UnixConnPool, error) {
-	if initialSize < 0 || maxSize <= 0 || initialSize > maxSize {
-		return nil, errors.New("invalid capacity settings")
-	}
-
-	pool := &UnixConnPool{
-		conns:   make(chan *net.UnixConn, maxSize),
-		factory: factory,
-	}
-
-	for range initialSize {
-		conn, err := factory()
-		if err != nil {
-			close(pool.conns)
-			for c := range pool.conns {
-				c.Close()
-			}
-			return nil, err
-		}
-		pool.conns <- conn
-	}
-
-	return pool, nil
-}
-
-func (p *UnixConnPool) Get() (*net.UnixConn, error) {
-	select {
-	case conn := <-p.conns:
-		if conn == nil {
-			return nil, errors.New("connection is nil from pool")
-		}
-		return conn, nil
-	default:
-		return p.factory()
-	}
-}
-
-func (p *UnixConnPool) Put(conn *net.UnixConn) {
-	if conn == nil {
-		return
-	}
-
-	select {
-	case p.conns <- conn:
-	default:
-		conn.Close()
-	}
-}
-
-func (p *UnixConnPool) Close() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.conns == nil {
-		return
-	}
-
-	close(p.conns)
-	for conn := range p.conns {
-		conn.Close()
-	}
-	p.conns = nil
-}
 
 type paymentServer struct {
 	gnet.BuiltinEventEngine
@@ -113,9 +41,13 @@ type paymentServer struct {
 	purgeConn        *net.UnixConn
 	ar               *routing.AdaptiveRouter
 	re               *regexp.Regexp
-	backendPool      *UnixConnPool
+	backendPool      *routing.UnixConnPool
 	nextBackendIndex atomic.Uint64
 	processPayment   func(c gnet.Conn, buf []byte)
+}
+
+func init() {
+	config.LoadEnv()
 }
 
 func main() {
@@ -161,9 +93,6 @@ func main() {
 	)
 	ar.Start(ctx)
 
-	healthUpdater := health.NewHealthUpdater(ar)
-	healthUpdater.Start(ctx)
-
 	ps := &paymentServer{
 		logger:       &logger,
 		ctx:          context.Background(),
@@ -174,6 +103,8 @@ func main() {
 		ar:           ar,
 		re:           regexp.MustCompile(`"correlationId"\s*:\s*"([^"]+)"`),
 	}
+
+	go ps.healthUpdateListener(os.Getenv("HEALTH_SOCKET_PATH"))
 
 	socketPath := os.Getenv("SOCKET_PATH")
 	if socketPath == "" {
@@ -205,7 +136,11 @@ func main() {
 			return net.DialUnix("unix", nil, addr)
 		}
 
-		pool, err := NewUnixConnPool(len(backendSockets)*2, len(backendSockets)*5, factory)
+		pool, err := routing.NewUnixConnPool(
+			len(backendSockets)*config.POOL_INIT_SIZE_FACTOR,
+			len(backendSockets)*config.POOL_MAX_SIZE_FACTOR,
+			factory,
+		)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("Failed to create connection pool")
 		}
@@ -335,4 +270,45 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		c.Write(http404NotFound)
 	}
 	return
+}
+
+func (ps *paymentServer) healthUpdateListener(socketPath string) {
+	for {
+		select {
+		case <-ps.ctx.Done():
+			return
+		default:
+			conn, err := net.Dial("unix", socketPath)
+			if err != nil {
+				ps.logger.Error().Err(err).Msg("failed to connect to health socket, retrying...")
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			ps.logger.Info().Msg("connected to health broadcast socket")
+			reader := bufio.NewReader(conn)
+			for {
+				line, err := reader.ReadBytes('\n')
+				if err != nil {
+					ps.logger.Error().
+						Err(err).
+						Msg("disconnected from health socket, reconnecting...")
+					conn.Close()
+					break
+				}
+
+				var report health.HealthReport
+				if err = json.Unmarshal(line, &report); err != nil {
+					ps.logger.Error().Err(err).Msg("failed to unmarshal health report")
+					continue
+				}
+
+				ps.ar.UpdateHealthMetrics(
+					report.Default.MinResponseTime,
+					report.Fallback.MinResponseTime,
+					report.Default.Failing,
+				)
+			}
+		}
+	}
 }
