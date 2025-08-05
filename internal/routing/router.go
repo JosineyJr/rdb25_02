@@ -64,7 +64,7 @@ func (ar *AdaptiveRouter) UpdateHealthMetrics(
 }
 
 func (ar *AdaptiveRouter) Start(ctx context.Context) {
-	for i := 0; i < ar.workers; i++ {
+	for range ar.workers {
 		go func() {
 			for {
 				select {

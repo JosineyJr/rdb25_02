@@ -156,7 +156,7 @@ func main() {
 	defer purgeConn.Close()
 
 	ar := routing.NewAdaptiveRouter(
-		2,
+		1,
 		paymentsConn,
 	)
 	ar.Start(ctx)
