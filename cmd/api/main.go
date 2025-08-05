@@ -23,7 +23,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// HTTP Responses
 var (
 	http200Ok        = []byte("HTTP/1.1 200 Ok\r\nContent-Length: 0\r\n\r\n")
 	http204NoContent = []byte("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -31,14 +30,12 @@ var (
 	http500Error     = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
 )
 
-// UnixConnPool gerencia um pool de conexões de soquete Unix.
 type UnixConnPool struct {
 	mu      sync.Mutex
 	conns   chan *net.UnixConn
 	factory func() (*net.UnixConn, error)
 }
 
-// NewUnixConnPool cria um novo pool de conexões.
 func NewUnixConnPool(
 	initialSize, maxSize int,
 	factory func() (*net.UnixConn, error),
@@ -67,7 +64,6 @@ func NewUnixConnPool(
 	return pool, nil
 }
 
-// Get retira uma conexão do pool ou cria uma nova se o pool estiver vazio.
 func (p *UnixConnPool) Get() (*net.UnixConn, error) {
 	select {
 	case conn := <-p.conns:
@@ -80,7 +76,6 @@ func (p *UnixConnPool) Get() (*net.UnixConn, error) {
 	}
 }
 
-// Put devolve uma conexão ao pool. Se a conexão for nil ou o pool estiver cheio, a conexão é fechada.
 func (p *UnixConnPool) Put(conn *net.UnixConn) {
 	if conn == nil {
 		return
@@ -93,7 +88,6 @@ func (p *UnixConnPool) Put(conn *net.UnixConn) {
 	}
 }
 
-// Close fecha todas as conexões no pool.
 func (p *UnixConnPool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -119,7 +113,7 @@ type paymentServer struct {
 	purgeConn        *net.UnixConn
 	ar               *routing.AdaptiveRouter
 	re               *regexp.Regexp
-	backendPool      *UnixConnPool // Alterado para usar o pool
+	backendPool      *UnixConnPool
 	nextBackendIndex atomic.Uint64
 	processPayment   func(c gnet.Conn, buf []byte)
 }
@@ -133,27 +127,27 @@ func main() {
 
 	paymentsAddr, err := net.ResolveUnixAddr("unix", os.Getenv("PAYMENTS_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 	paymentsConn, err := net.DialUnix("unix", nil, paymentsAddr)
 	if err != nil {
-		log.Fatalf("Failed to dial socket: %v", err)
+		log.Fatalf("F=failed to dial socket: %v", err)
 	}
 	defer paymentsConn.Close()
 
 	summaryAddr, err := net.ResolveUnixAddr("unix", os.Getenv("SUMMARY_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 	summaryConn, err := net.DialUnix("unix", nil, summaryAddr)
 	if err != nil {
-		log.Fatalf("Failed to dial socket: %v", err)
+		log.Fatalf("failed to dial socket: %v", err)
 	}
 	defer summaryConn.Close()
 
 	purgeAddr, err := net.ResolveUnixAddr("unix", os.Getenv("PURGE_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 	purgeConn, err := net.DialUnix("unix", nil, purgeAddr)
 	if err != nil {
@@ -202,7 +196,6 @@ func main() {
 		backendSockets := []string{"/sockets/api2.sock", "/sockets/api3.sock"}
 		var currentSocket uint64
 
-		// Factory para criar novas conexões para o pool
 		factory := func() (*net.UnixConn, error) {
 			sockPath := backendSockets[atomic.AddUint64(&currentSocket, 1)%uint64(len(backendSockets))]
 			addr, err := net.ResolveUnixAddr("unix", sockPath)
@@ -212,8 +205,7 @@ func main() {
 			return net.DialUnix("unix", nil, addr)
 		}
 
-		// Cria um pool com 5 conexões iniciais por backend e um máximo de 50 no total
-		pool, err := NewUnixConnPool(len(backendSockets)*5, 50, factory)
+		pool, err := NewUnixConnPool(len(backendSockets)*2, len(backendSockets)*5, factory)
 		if err != nil {
 			logger.Fatal().Err(err).Msg("Failed to create connection pool")
 		}
@@ -230,31 +222,23 @@ func main() {
 				return
 			}
 
-			// Nó 0: LB processa localmente
 			if nodeIndex == 0 {
-				ps.logger.Info().Msg("LB is processing the request locally")
 				ps.ar.PayloadChan <- string(matches[1])
 				return
 			}
 
-			// Outros nós: encaminha para um backend usando o pool
-			logger.Info().Msgf("Forwarding request to a backend worker")
-
 			conn, err := ps.backendPool.Get()
 			if err != nil {
-				ps.logger.Error().Err(err).Msg("Failed to get connection from pool")
-				// Se não conseguirmos uma conexão, podemos tentar processar localmente como fallback
+				ps.logger.Error().Err(err).Msg("failed to get connection from pool")
 				ps.ar.PayloadChan <- string(matches[1])
 				return
 			}
 
 			_, err = conn.Write(buf)
 			if err != nil {
-				ps.logger.Error().Err(err).Msg("Failed to write to payment backend")
-				// A conexão está ruim, feche-a e não a devolva ao pool
+				ps.logger.Error().Err(err).Msg("failed to write to payment backend")
 				conn.Close()
 			} else {
-				// Devolve a conexão ao pool se a escrita foi bem-sucedida
 				ps.backendPool.Put(conn)
 			}
 		}
