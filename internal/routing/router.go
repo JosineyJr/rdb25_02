@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -82,7 +83,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 						continue
 					}
 
-					success := targetFunc(ctx, &p)
+					success := targetFunc(ctx, p)
 
 					ar.updateCircuitState(processorName, success)
 
@@ -99,7 +100,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 	}
 }
 
-func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *string) bool, processorName string) {
+func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, string) bool, processorName string) {
 	state := ar.cbState.Load()
 
 	if state == StateOpen {
@@ -122,7 +123,7 @@ func (ar *AdaptiveRouter) chooseProcessor() (target func(context.Context, *strin
 	}
 
 	if fl > 0 && dl > (3*fl) {
-		if fl > 20 {
+		if fl >= 15 {
 			return ar.sendToDefault, payments.DefaultProcessor
 		}
 
@@ -171,7 +172,7 @@ func (ar *AdaptiveRouter) openCircuit() {
 
 func (ar *AdaptiveRouter) sendToDefault(
 	ctx context.Context,
-	correlationId *string,
+	correlationId string,
 ) bool {
 	return ar.sendRequest(
 		ctx,
@@ -183,7 +184,7 @@ func (ar *AdaptiveRouter) sendToDefault(
 
 func (ar *AdaptiveRouter) sendToFallback(
 	ctx context.Context,
-	correlationId *string,
+	correlationId string,
 ) bool {
 	return ar.sendRequest(
 		ctx,
@@ -196,7 +197,7 @@ func (ar *AdaptiveRouter) sendToFallback(
 func (ar *AdaptiveRouter) sendRequest(
 	ctx context.Context,
 	url, processorName string,
-	correlationId *string,
+	correlationId string,
 ) bool {
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
@@ -232,6 +233,7 @@ func (ar *AdaptiveRouter) sendRequest(
 	}
 
 	if resp.StatusCode() == http.StatusUnprocessableEntity {
+		log.Println(correlationId, resp.StatusCode())
 		return true
 	}
 

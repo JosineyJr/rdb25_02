@@ -127,36 +127,36 @@ func main() {
 
 	paymentsAddr, err := net.ResolveUnixAddr("unix", os.Getenv("PAYMENTS_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 	paymentsConn, err := net.DialUnix("unix", nil, paymentsAddr)
 	if err != nil {
-		log.Fatalf("Failed to dial socket: %v", err)
+		log.Fatalf("failed to dial socket: %v", err)
 	}
 	defer paymentsConn.Close()
 
 	summaryAddr, err := net.ResolveUnixAddr("unix", os.Getenv("SUMMARY_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 	summaryConn, err := net.DialUnix("unix", nil, summaryAddr)
 	if err != nil {
-		log.Fatalf("Failed to dial socket: %v", err)
+		log.Fatalf("failed to dial socket: %v", err)
 	}
 	defer summaryConn.Close()
 
 	purgeAddr, err := net.ResolveUnixAddr("unix", os.Getenv("PURGE_SOCKET_PATH"))
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 	purgeConn, err := net.DialUnix("unix", nil, purgeAddr)
 	if err != nil {
-		log.Fatalf("Failed to dial socket: %v", err)
+		log.Fatalf("failed to dial socket: %v", err)
 	}
 	defer purgeConn.Close()
 
 	ar := routing.NewAdaptiveRouter(
-		1,
+		3,
 		paymentsConn,
 	)
 	ar.Start(ctx)
@@ -183,7 +183,7 @@ func main() {
 	socketDir := filepath.Dir(socketPath)
 	if _, err := os.Stat(socketDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(socketDir, 0777); err != nil {
-			log.Fatalf("Failed to create socket dir %s: %v", socketDir, err)
+			log.Fatalf("failed to create socket dir %s: %v", socketDir, err)
 		}
 	}
 
@@ -207,7 +207,7 @@ func main() {
 
 		pool, err := NewUnixConnPool(len(backendSockets)*5, 50, factory)
 		if err != nil {
-			logger.Fatal().Err(err).Msg("Failed to create connection pool")
+			logger.Fatal().Err(err).Msg("failed to create connection pool")
 		}
 		ps.backendPool = pool
 
@@ -223,23 +223,20 @@ func main() {
 			}
 
 			if nodeIndex == 0 {
-				ps.logger.Info().Msg("LB is processing the request locally")
 				ps.ar.PayloadChan <- string(matches[1])
 				return
 			}
 
-			logger.Info().Msgf("Forwarding request to a backend worker")
-
 			conn, err := ps.backendPool.Get()
 			if err != nil {
-				ps.logger.Error().Err(err).Msg("Failed to get connection from pool")
+				ps.logger.Error().Err(err).Msg("failed to get connection from pool")
 				ps.ar.PayloadChan <- string(matches[1])
 				return
 			}
 
 			_, err = conn.Write(buf)
 			if err != nil {
-				ps.logger.Error().Err(err).Msg("Failed to write to payment backend")
+				ps.logger.Error().Err(err).Msg("failed to write to payment backend")
 				conn.Close()
 			} else {
 				ps.backendPool.Put(conn)
@@ -255,18 +252,19 @@ func main() {
 		addr = fmt.Sprintf("unix://%s", ps.socketPath)
 	}
 
-	logger.Info().Msgf("Gnet server starting on %s", addr)
+	logger.Info().Msgf("gnet server starting on %s", addr)
 	err = gnet.Run(ps, addr,
 		gnet.WithMulticore(true),
 		gnet.WithReusePort(true),
+		gnet.WithLockOSThread(true),
 	)
 	if err != nil {
-		log.Fatalf("Gnet server failed to start: %v", err)
+		log.Fatalf("gnet server failed to start: %v", err)
 	}
 }
 
 func (ps *paymentServer) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	ps.logger.Info().Msgf("Gnet server started on port %s", config.PORT)
+	ps.logger.Info().Msgf("gnet server started on port %s", config.PORT)
 	return
 }
 
@@ -284,21 +282,18 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 	requestLineEnd := bytes.Index(buf, []byte("\r\n"))
 	if requestLineEnd == -1 {
-		fmt.Println("Requisição inválida")
 		return
 	}
 	requestLine := buf[:requestLineEnd]
 
 	pathStart := bytes.IndexByte(requestLine, ' ')
 	if pathStart == -1 {
-		fmt.Println("Espaçamento inválido")
 		return
 	}
 	pathStart++
 
 	pathEnd := bytes.LastIndexByte(requestLine, ' ')
 	if pathEnd == -1 || pathEnd <= pathStart {
-		fmt.Println("Formato de requisição inválido")
 		return
 	}
 
@@ -310,7 +305,7 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	case "/payments-summary":
 		_, err := ps.summaryConn.Write(append(query, '\n'))
 		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to write to summary socket")
+			ps.logger.Error().Err(err).Msg("failed to write to summary socket")
 			c.Write(http500Error)
 			return
 		}
@@ -318,7 +313,7 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		reader := bufio.NewReader(ps.summaryConn)
 		s, err := reader.ReadBytes('\n')
 		if err != nil {
-			ps.logger.Error().Err(err).Msg("Failed to read from summary socket")
+			ps.logger.Error().Err(err).Msg("failed to read from summary socket")
 			c.Write(http500Error)
 			return
 		}
