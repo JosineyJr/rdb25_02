@@ -11,13 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
 )
@@ -110,7 +110,6 @@ type paymentServer struct {
 	paymentsConn     *net.UnixConn
 	summaryConn      *net.UnixConn
 	purgeConn        *net.UnixConn
-	re               *regexp.Regexp
 	backendPool      *UnixConnPool
 	nextBackendIndex atomic.Uint64
 	processPayment   func(c gnet.Conn, buf []byte)
@@ -160,7 +159,6 @@ func main() {
 		paymentsConn: paymentsConn,
 		summaryConn:  summaryConn,
 		purgeConn:    purgeConn,
-		re:           regexp.MustCompile(`"correlationId"\s*:\s*"([^"]+)"`),
 	}
 
 	socketPath := os.Getenv("SOCKET_PATH")
@@ -181,7 +179,7 @@ func main() {
 
 	var addr string
 	if os.Getenv("LB") == "1" {
-		backendSockets := []string{"/tmp/api2.sock", "/tmp/api3.sock"}
+		backendSockets := []string{"/sockets/api2.sock", "/sockets/api3.sock"}
 		var currentSocket uint64
 
 		factory := func() (*net.UnixConn, error) {
@@ -202,16 +200,21 @@ func main() {
 		totalProcessingNodes := uint64(len(backendSockets) + 1)
 
 		ps.processPayment = func(c gnet.Conn, buf []byte) {
-			nodeIndex := (ps.nextBackendIndex.Add(1) - 1) % totalProcessingNodes
-
-			matches := ps.re.FindSubmatch(buf)
-			if len(matches) < 2 {
+			bodyStart := bytes.Index(buf, []byte("\r\n\r\n"))
+			if bodyStart == -1 {
+				return
+			}
+			jsonBody := buf[bodyStart+4:]
+			correlationId := jsoniter.Get(jsonBody, "correlationId").ToString()
+			if correlationId == "" {
 				return
 			}
 
+			nodeIndex := (ps.nextBackendIndex.Add(1) - 1) % totalProcessingNodes
+
 			if nodeIndex == 0 {
 				ps.paymentsConn.Write(
-					append(matches[1], '\n'),
+					append([]byte(correlationId), '\n'),
 				)
 				return
 			}
@@ -220,7 +223,7 @@ func main() {
 			if err != nil {
 				ps.logger.Error().Err(err).Msg("failed to get connection from pool")
 				ps.paymentsConn.Write(
-					append(matches[1], '\n'),
+					append([]byte(correlationId), '\n'),
 				)
 				return
 			}
@@ -236,9 +239,18 @@ func main() {
 		addr = "tcp4://" + config.PORT
 	} else {
 		ps.processPayment = func(c gnet.Conn, buf []byte) {
-			matches := ps.re.FindSubmatch(buf)
+			bodyStart := bytes.Index(buf, []byte("\r\n\r\n"))
+			if bodyStart == -1 {
+				return
+			}
+			jsonBody := buf[bodyStart+4:]
+			correlationId := jsoniter.Get(jsonBody, "correlationId").ToString()
+			if correlationId == "" {
+				return
+			}
+
 			ps.paymentsConn.Write(
-				append(matches[1], '\n'),
+				append([]byte(correlationId), '\n'),
 			)
 		}
 		addr = fmt.Sprintf("unix://%s", ps.socketPath)

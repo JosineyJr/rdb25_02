@@ -36,11 +36,11 @@ func main() {
 
 	summaryAggregator, err := storage.NewInMemoryAggregator()
 	if err != nil {
-		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
+		logger.Fatal().Err(err).Msg("unable to create in-memory aggregator")
 	}
 
 	ar := routing.NewAdaptiveRouter(
-		6,
+		256,
 		summaryAggregator,
 	)
 	ar.Start(ctx)
