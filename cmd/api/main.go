@@ -15,10 +15,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
-	"github.com/JosineyJr/rdb25_02/internal/health"
-	"github.com/JosineyJr/rdb25_02/internal/routing"
 	"github.com/panjf2000/gnet/v2"
 	"github.com/rs/zerolog"
 )
@@ -111,7 +110,6 @@ type paymentServer struct {
 	paymentsConn     *net.UnixConn
 	summaryConn      *net.UnixConn
 	purgeConn        *net.UnixConn
-	ar               *routing.AdaptiveRouter
 	re               *regexp.Regexp
 	backendPool      *UnixConnPool
 	nextBackendIndex atomic.Uint64
@@ -119,7 +117,7 @@ type paymentServer struct {
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	_, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	config.LoadEnv()
 
@@ -155,15 +153,6 @@ func main() {
 	}
 	defer purgeConn.Close()
 
-	ar := routing.NewAdaptiveRouter(
-		3,
-		paymentsConn,
-	)
-	ar.Start(ctx)
-
-	healthUpdater := health.NewHealthUpdater(ar)
-	healthUpdater.Start(ctx)
-
 	ps := &paymentServer{
 		logger:       &logger,
 		ctx:          context.Background(),
@@ -171,7 +160,6 @@ func main() {
 		paymentsConn: paymentsConn,
 		summaryConn:  summaryConn,
 		purgeConn:    purgeConn,
-		ar:           ar,
 		re:           regexp.MustCompile(`"correlationId"\s*:\s*"([^"]+)"`),
 	}
 
@@ -193,7 +181,7 @@ func main() {
 
 	var addr string
 	if os.Getenv("LB") == "1" {
-		backendSockets := []string{"/sockets/api2.sock", "/sockets/api3.sock"}
+		backendSockets := []string{"/tmp/api2.sock", "/tmp/api3.sock"}
 		var currentSocket uint64
 
 		factory := func() (*net.UnixConn, error) {
@@ -214,7 +202,6 @@ func main() {
 		totalProcessingNodes := uint64(len(backendSockets) + 1)
 
 		ps.processPayment = func(c gnet.Conn, buf []byte) {
-			c.Write(http200Ok)
 			nodeIndex := (ps.nextBackendIndex.Add(1) - 1) % totalProcessingNodes
 
 			matches := ps.re.FindSubmatch(buf)
@@ -223,14 +210,18 @@ func main() {
 			}
 
 			if nodeIndex == 0 {
-				ps.ar.PayloadChan <- string(matches[1])
+				ps.paymentsConn.Write(
+					append(matches[1], '\n'),
+				)
 				return
 			}
 
 			conn, err := ps.backendPool.Get()
 			if err != nil {
 				ps.logger.Error().Err(err).Msg("failed to get connection from pool")
-				ps.ar.PayloadChan <- string(matches[1])
+				ps.paymentsConn.Write(
+					append(matches[1], '\n'),
+				)
 				return
 			}
 
@@ -245,9 +236,10 @@ func main() {
 		addr = "tcp4://" + config.PORT
 	} else {
 		ps.processPayment = func(c gnet.Conn, buf []byte) {
-			c.Write(http200Ok)
 			matches := ps.re.FindSubmatch(buf)
-			ps.ar.PayloadChan <- string(matches[1])
+			ps.paymentsConn.Write(
+				append(matches[1], '\n'),
+			)
 		}
 		addr = fmt.Sprintf("unix://%s", ps.socketPath)
 	}
@@ -275,6 +267,8 @@ func (ps *paymentServer) OnShutdown(eng gnet.Engine) {
 }
 
 func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
+	n := time.Now()
+
 	buf, err := c.Next(-1)
 	if err != nil {
 		return gnet.Close
@@ -301,8 +295,24 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 	switch string(path) {
 	case "/payments":
+		defer func(t time.Time) {
+			d := time.Since(t)
+			if d >= time.Millisecond {
+				ps.logger.Info().Str("duration", d.String()).Msg("payments")
+			}
+		}(n)
+		c.Write(http200Ok)
 		ps.processPayment(c, buf)
+		return
 	case "/payments-summary":
+		defer func(t time.Time) {
+			d := time.Since(t)
+			if d >= time.Millisecond {
+				ps.logger.Info().Str("duration", d.String()).Msg("summary")
+			}
+		}(n)
+
+		c.Write([]byte("HTTP/1.1 200 Ok\r\n"))
 		_, err := ps.summaryConn.Write(append(query, '\n'))
 		if err != nil {
 			ps.logger.Error().Err(err).Msg("failed to write to summary socket")
@@ -320,12 +330,20 @@ func (ps *paymentServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		s = bytes.TrimSpace(s)
 
 		response := fmt.Sprintf(
-			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+			"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
 			len(s),
 			s,
 		)
 		c.Write([]byte(response))
+		return
 	case "/purge-payments":
+		defer func(t time.Time) {
+			d := time.Since(t)
+			if d >= time.Millisecond {
+				ps.logger.Info().Str("duration", d.String()).Msg("purge")
+			}
+		}(n)
+
 		c.Write(http204NoContent)
 		ps.purgeConn.Write([]byte("1\n"))
 	default:

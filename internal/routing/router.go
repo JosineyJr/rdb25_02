@@ -3,13 +3,12 @@ package routing
 import (
 	"context"
 	"log"
-	"net"
 	"net/http"
-	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
+	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/valyala/fasthttp"
@@ -29,26 +28,26 @@ const (
 )
 
 type AdaptiveRouter struct {
-	cbLastOpenTime  time.Time
-	paymentsConn    *net.UnixConn
-	client          *fasthttp.Client
-	PayloadChan     chan string
-	workers         int
-	cbState         atomic.Int32
-	cbFailures      atomic.Int32
-	defaultLatency  atomic.Int32
-	fallbackLatency atomic.Int32
+	cbLastOpenTime    time.Time
+	client            *fasthttp.Client
+	PayloadChan       chan string
+	workers           int
+	cbState           atomic.Int32
+	cbFailures        atomic.Int32
+	defaultLatency    atomic.Int32
+	fallbackLatency   atomic.Int32
+	summaryAggregator *storage.RingBufferAggregator
 }
 
 func NewAdaptiveRouter(
 	workers int,
-	paymentsConn *net.UnixConn,
+	summaryAggregator *storage.RingBufferAggregator,
 ) *AdaptiveRouter {
 	return &AdaptiveRouter{
-		client:       &fasthttp.Client{},
-		workers:      workers,
-		PayloadChan:  make(chan string, 5500),
-		paymentsConn: paymentsConn,
+		client:            &fasthttp.Client{},
+		workers:           workers,
+		PayloadChan:       make(chan string, 31500),
+		summaryAggregator: summaryAggregator,
 	}
 }
 
@@ -78,7 +77,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 
 					targetFunc, processorName := ar.chooseProcessor()
 					if targetFunc == nil {
-						time.Sleep(50 * time.Millisecond)
+						time.Sleep(200 * time.Millisecond)
 						ar.PayloadChan <- p
 						continue
 					}
@@ -88,7 +87,7 @@ func (ar *AdaptiveRouter) Start(ctx context.Context) {
 					ar.updateCircuitState(processorName, success)
 
 					if !success {
-						time.Sleep(50 * time.Millisecond)
+						time.Sleep(200 * time.Millisecond)
 						ar.PayloadChan <- p
 						continue
 					}
@@ -226,9 +225,8 @@ func (ar *AdaptiveRouter) sendRequest(
 	}
 
 	if resp.StatusCode() >= 200 && resp.StatusCode() < 300 {
-		ar.paymentsConn.Write(
-			[]byte(processorName + "|" + strconv.Itoa(int(payload.RequestedAt.UnixNano())) + "\n"),
-		)
+		time.Sleep(2 * time.Millisecond)
+		ar.summaryAggregator.Update(ctx, payments.DefaultProcessor, payload.RequestedAt.Unix())
 		return true
 	}
 

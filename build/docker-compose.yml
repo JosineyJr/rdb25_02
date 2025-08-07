@@ -3,10 +3,11 @@ x-service-templates:
     build:
       context: ../
       dockerfile: ./build/Dockerfile
+    security_opt:
+      - seccomp=unconfined
     volumes:
       - sockets:/sockets
     networks:
-      - backend
       - payment-processor
 
 services:
@@ -108,7 +109,5 @@ volumes:
   sockets:
 
 networks:
-  backend:
-    driver: bridge
   payment-processor:
     external: true

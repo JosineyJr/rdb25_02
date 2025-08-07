@@ -10,11 +10,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/JosineyJr/rdb25_02/internal/config"
+	"github.com/JosineyJr/rdb25_02/internal/health"
+	"github.com/JosineyJr/rdb25_02/internal/routing"
 	"github.com/JosineyJr/rdb25_02/internal/storage"
 	"github.com/JosineyJr/rdb25_02/pkg/payments"
 	jsoniter "github.com/json-iterator/go"
@@ -38,6 +39,15 @@ func main() {
 		logger.Fatal().Err(err).Msg("Unable to create in-memory aggregator")
 	}
 
+	ar := routing.NewAdaptiveRouter(
+		6,
+		summaryAggregator,
+	)
+	ar.Start(ctx)
+
+	healthUpdater := health.NewHealthUpdater(ar)
+	healthUpdater.Start(ctx)
+
 	setupSocketPath(os.Getenv("PAYMENTS_SOCKET_PATH"), &logger)
 	setupSocketPath(os.Getenv("SUMMARY_SOCKET_PATH"), &logger)
 	setupSocketPath(os.Getenv("PURGE_SOCKET_PATH"), &logger)
@@ -52,17 +62,7 @@ func main() {
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			buf := scanner.Bytes()
-			parts := bytes.SplitN(buf, []byte("|"), 2)
-			if len(parts) != 2 {
-				continue
-			}
-
-			processor := string(parts[0])
-			ts, err := strconv.ParseInt(string(parts[1]), 10, 64)
-			if err != nil {
-				continue
-			}
-			summaryAggregator.Update(ctx, processor, ts)
+			ar.PayloadChan <- string(buf)
 		}
 	})
 
